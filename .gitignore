@@ -1,0 +1,70 @@
+# Build results
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+ARM/
+ARM64/
+
+# .NET generated files
+*.user
+*.rsuser
+*.suo
+*.userosscache
+*.sln.docstates
+*.nupkg
+*.snupkg
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# NuGet
+*.nuget.props
+*.nuget.targets
+packages/
+!**/packages/build/
+!**/packages/repositories.config
+NuGet.Config.user
+
+# Visual Studio
+.vs/
+TestResults/
+BenchmarkDotNet.Artifacts/
+
+# Rider / JetBrains
+.idea/
+*.DotSettings.user
+
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Coverage and test output
+coverage/
+coverage*/
+*.coverage
+*.coveragexml
+coverage.cobertura.xml
+
+# Logs
+*.log
+logs/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+Client/config.json
+Server/config.json
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+Server/publish/VirtualIPServer
+Server/publish/VirtualIPServer.pdb
