@@ -72,3 +72,4 @@ Server/publish/VirtualIPServer.pdb
 #publish
 publish.cmd
 Server/public.cmd
+**/[Pp]ublish/
