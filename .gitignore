@@ -68,3 +68,6 @@ Thumbs.db
 Desktop.ini
 Server/publish/VirtualIPServer
 Server/publish/VirtualIPServer.pdb
+
+#publish
+publish.cmd

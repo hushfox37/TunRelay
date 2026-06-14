@@ -25,9 +25,9 @@ namespace VirtualIPServer
                 FullMode = BoundedChannelFullMode.Wait
             });
 
-        static string TunnelIP = "172.30.98.75";
-        public static int ListenPort = 12345;
-        static int[] ports = { 19191 };
+        static string TunnelIP;
+        public static int ListenPort;
+        static int[] ports;
 
         static async Task Main(string[] args)
         {
