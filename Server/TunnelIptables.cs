@@ -6,7 +6,7 @@ namespace VirtualIPServer
     {
         static bool _cleared;
 
-        static void Run(string args)
+        static int Run(string args, bool logErrors = true)
         {
             var psi = new ProcessStartInfo("iptables", args)
             {
@@ -16,27 +16,61 @@ namespace VirtualIPServer
 
             using var p = Process.Start(psi)!;
             p.WaitForExit();
-            if (p.ExitCode != 0)
-                Console.WriteLine($"iptables {args} 失败: {p.StandardError.ReadToEnd()}");
+            if (p.ExitCode != 0 && logErrors)
+                Console.WriteLine($"iptables {args} failed: {p.StandardError.ReadToEnd()}");
+            return p.ExitCode;
         }
 
-        public static void Add(int[] ports)
+        public static void Add(int[] tcpPorts, int[] udpPorts)
         {
-            var portList = string.Join(",", ports);
-            Run($"-I INPUT -p tcp -m multiport --dports {portList} -j NFQUEUE --queue-num 100");
-            Run($"-I INPUT -p udp -m multiport --dports {portList} -j NFQUEUE --queue-num 100");
-            Console.WriteLine($"iptables 规则已添加: {portList}");
+            RemoveStaleCrossProtocolRules(tcpPorts, udpPorts);
+
+            AddProtocol("tcp", tcpPorts);
+            AddProtocol("udp", udpPorts);
         }
 
-        public static void Remove(int[] ports)
+        public static void Remove(int[] tcpPorts, int[] udpPorts)
         {
             if (_cleared) return;
             _cleared = true;
 
+            RemoveProtocol("tcp", tcpPorts);
+            RemoveProtocol("udp", udpPorts);
+        }
+
+        static void AddProtocol(string protocol, int[] ports)
+        {
+            if (ports.Length == 0) return;
+
+            RemoveProtocol(protocol, ports);
+
             var portList = string.Join(",", ports);
-            Run($"-D INPUT -p tcp -m multiport --dports {portList} -j NFQUEUE --queue-num 100");
-            Run($"-D INPUT -p udp -m multiport --dports {portList} -j NFQUEUE --queue-num 100");
-            Console.WriteLine($"iptables 规则已清理: {portList}");
+            Run($"-I INPUT -p {protocol} -m multiport --dports {portList} -j NFQUEUE --queue-num 100");
+            Console.WriteLine($"iptables {protocol} rules added: {portList}");
+        }
+
+        static void RemoveProtocol(string protocol, int[] ports)
+        {
+            if (ports.Length == 0) return;
+
+            var portList = string.Join(",", ports);
+            int removed = 0;
+            while (Run($"-D INPUT -p {protocol} -m multiport --dports {portList} -j NFQUEUE --queue-num 100", false) == 0)
+            {
+                removed++;
+            }
+
+            if (removed > 0)
+                Console.WriteLine($"iptables {protocol} stale rules removed: {portList} x{removed}");
+        }
+
+        static void RemoveStaleCrossProtocolRules(int[] tcpPorts, int[] udpPorts)
+        {
+            var tcpOnlyCleanup = udpPorts.Except(tcpPorts).ToArray();
+            var udpOnlyCleanup = tcpPorts.Except(udpPorts).ToArray();
+
+            RemoveProtocol("tcp", tcpOnlyCleanup);
+            RemoveProtocol("udp", udpOnlyCleanup);
         }
     }
 }

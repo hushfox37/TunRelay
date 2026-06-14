@@ -5,7 +5,8 @@ public class VirtualIPConfig
     public string ServerIP { get; set; } = "";
     public int ListenPort { get; set; } = 19192;
     public string VirtualIp { get; set; } = "";
-    public int[] Ports { get; set; } = { 19191 };
+    public int[] TcpPorts { get; set; } = { 19191 };
+    public int[] UdpPorts { get; set; } = Array.Empty<int>();
     public string ClientID { get; set; } = "";
     public string Secret { get; set; } = "";
 }

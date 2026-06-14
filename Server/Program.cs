@@ -27,6 +27,8 @@ namespace VirtualIPServer
 
         static string TunnelIP;
         public static int ListenPort;
+        static int[] tcpPorts;
+        static int[] udpPorts;
         static int[] ports;
 
         static async Task Main(string[] args)
@@ -43,7 +45,7 @@ namespace VirtualIPServer
                 return;
             }
 
-            Console.WriteLine($"配置: TunnelIP={TunnelIP}, ListenPort={ListenPort}, Ports={string.Join(",", ports)}, ClientID={config.ClientID}");
+            Console.WriteLine($"配置: TunnelIP={TunnelIP}, ListenPort={ListenPort}, Ports={string.Join(",", ports)}, TcpPorts={string.Join(",", tcpPorts)}, UdpPorts={string.Join(",", udpPorts)}, ClientID={config.ClientID}");
 
             var cert = ServerNet.GenerateSelfSignedCertificate(config.ServerIP);
             var listener = new TcpListener(IPAddress.Any, ListenPort);
@@ -56,22 +58,22 @@ namespace VirtualIPServer
             Console.CancelKeyPress += (_, e) =>
             {
                 e.Cancel = true;
-                IptablesManager.Remove(ports);
+                IptablesManager.Remove(tcpPorts, udpPorts);
                 cts.Cancel();
             };
             AppDomain.CurrentDomain.ProcessExit += (_, _) =>
             {
-                IptablesManager.Remove(ports);
+                IptablesManager.Remove(tcpPorts, udpPorts);
             };
 
             using var client = await ServerNet.AcceptAuthenticatedClientAsync(listener, cert, config, cts.Token);
 
-            var json = JsonConvert.SerializeObject(new { TunnelIP, Ports = ports });
+            var json = JsonConvert.SerializeObject(new { TunnelIP, Ports = ports, TcpPorts = tcpPorts, UdpPorts = udpPorts });
             await ServerNet.SendAsync(client.ControlSsl, Encoding.UTF8.GetBytes(json), cts.Token);
-            Console.WriteLine($"已下发 TunnelIP: {TunnelIP}, Ports: {string.Join(",", ports)}");
+            Console.WriteLine($"已下发 TunnelIP: {TunnelIP}, Ports: {string.Join(",", ports)}, TcpPorts: {string.Join(",", tcpPorts)}, UdpPorts: {string.Join(",", udpPorts)}");
 
             RawSender.Init();
-            IptablesManager.Add(ports);
+            IptablesManager.Add(tcpPorts, udpPorts);
             NFQueue.Start(100, TunnelIP, TX_channel, cts.Token);
 
             _ = Task.Run(() => RawInjectLoop(cts.Token), cts.Token);
@@ -90,16 +92,33 @@ namespace VirtualIPServer
         {
             TunnelIP = config.VirtualIp;
             ListenPort = config.ListenPort;
-            ports = config.Ports;
+            tcpPorts = NormalizePorts(config.TcpPorts);
+            udpPorts = NormalizePorts(config.UdpPorts);
+            ports = tcpPorts.Concat(udpPorts).Distinct().OrderBy(port => port).ToArray();
 
             if (string.IsNullOrWhiteSpace(TunnelIP))
                 throw new InvalidOperationException("config.json: VirtualIp 不能为空");
             if (ListenPort <= 0 || ListenPort > 65535)
                 throw new InvalidOperationException("config.json: ListenPort 必须是 1-65535");
-            if (ports.Length == 0 || ports.Any(port => port <= 0 || port > 65535))
-                throw new InvalidOperationException("config.json: Ports 必须是 1-65535 的端口列表");
+            if (ports.Length == 0)
+                throw new InvalidOperationException("config.json: TcpPorts/UdpPorts 至少需要配置一个端口");
+
+            ValidatePorts("TcpPorts", tcpPorts);
+            ValidatePorts("UdpPorts", udpPorts);
+
             if (string.IsNullOrWhiteSpace(config.ClientID))
                 throw new InvalidOperationException("config.json: ClientID 不能为空");
+        }
+
+        static int[] NormalizePorts(IEnumerable<int> values)
+        {
+            return values.Distinct().OrderBy(port => port).ToArray();
+        }
+
+        static void ValidatePorts(string name, int[] values)
+        {
+            if (values.Any(port => port <= 0 || port > 65535))
+                throw new InvalidOperationException($"config.json: {name} 必须是 1-65535 的端口列表");
         }
 
         static async Task RawInjectLoop(CancellationToken ct)
