@@ -236,7 +236,6 @@ namespace VirtualIPServer
 
         class Program
         {
-            public static string TunnelIP = "172.30.98.75";
             public static int ListenPort = 12345;
 
             public static readonly Channel<PacketBuffer> RX_channel =
@@ -255,11 +254,13 @@ namespace VirtualIPServer
                     FullMode = BoundedChannelFullMode.Wait
                 });
 
-            static int[] ports = new[] { 19191 };
+            static string TunnelIP = "172.30.98.75";
+            static int[] ports = { 19191 };
 
             static async Task Main(string[] args)
             {
-                var config = ConfigManager.LoadOrCreate<VirtualIPConfig>("config.json");
+                const string configPath = "config.json";
+                var config = ConfigManager.LoadOrCreate<VirtualIPConfig>(configPath);
                 TunnelIP = config.VirtualIp;
                 ListenPort = config.ListenPort;
                 ports = config.Ports;
@@ -269,7 +270,15 @@ namespace VirtualIPServer
                     throw new InvalidOperationException("config.json: ListenPort 必须是 1-65535");
                 if (ports.Length == 0 || ports.Any(port => port <= 0 || port > 65535))
                     throw new InvalidOperationException("config.json: Ports 必须是 1-65535 的端口列表");
-                Console.WriteLine($"配置: TunnelIP={TunnelIP}, ListenPort={ListenPort}, Ports={string.Join(",", ports)}");
+                if (string.IsNullOrWhiteSpace(config.ClientID))
+                    throw new InvalidOperationException("config.json: ClientID 不能为空");
+                if (string.IsNullOrWhiteSpace(config.Secret))
+                {
+                    config.Secret = GenerateSecret();
+                    ConfigManager.Save(configPath, config);
+                    Console.WriteLine("已生成 Secret 并写入 config.json");
+                }
+                Console.WriteLine($"配置: TunnelIP={TunnelIP}, ListenPort={ListenPort}, Ports={string.Join(",", ports)}, ClientID={config.ClientID}");
 
                 var cert = GenerateSelfSignedCertificate();
                 var listener = new TcpListener(IPAddress.Any, ListenPort);
@@ -289,26 +298,8 @@ namespace VirtualIPServer
                     IptablesManager.Remove(ports);
                 };
 
-                Console.WriteLine("等待控制连接...");
-                var controlTcp = await listener.AcceptTcpClientAsync(cts.Token);
-                controlTcp.NoDelay = true;
-                var controlSsl = new SslStream(controlTcp.GetStream(), false);
-                await controlSsl.AuthenticateAsServerAsync(cert, false, false);
-                Console.WriteLine($"控制连接来自 {controlTcp.Client.RemoteEndPoint}");
-
-                Console.WriteLine("等待TX数据连接...");
-                var txTcp = await listener.AcceptTcpClientAsync(cts.Token);
-                txTcp.NoDelay = true;
-                var txSsl = new SslStream(txTcp.GetStream(), false);
-                await txSsl.AuthenticateAsServerAsync(cert, false, false);
-                Console.WriteLine($"TX数据连接来自 {txTcp.Client.RemoteEndPoint}");
-
-                Console.WriteLine("等待RX数据连接...");
-                var rxTcp = await listener.AcceptTcpClientAsync(cts.Token);
-                rxTcp.NoDelay = true;
-                var rxSsl = new SslStream(rxTcp.GetStream(), false);
-                await rxSsl.AuthenticateAsServerAsync(cert, false, false);
-                Console.WriteLine($"RX数据连接来自 {rxTcp.Client.RemoteEndPoint}");
+                var (controlTcp, controlSsl, txTcp, txSsl, rxTcp, rxSsl) =
+                    await AcceptAuthenticatedClientAsync(listener, cert, config, cts.Token);
 
                 var json = JsonConvert.SerializeObject(new { TunnelIP, Ports = ports });
                 await SendAsync(controlSsl, Encoding.UTF8.GetBytes(json), cts.Token);
@@ -331,6 +322,131 @@ namespace VirtualIPServer
                 txSsl.Dispose(); txTcp.Dispose();
                 rxSsl.Dispose(); rxTcp.Dispose();
                 listener.Stop();
+            }
+
+            static async Task<(TcpClient ControlTcp, SslStream ControlSsl, TcpClient TxTcp, SslStream TxSsl, TcpClient RxTcp, SslStream RxSsl)>
+                AcceptAuthenticatedClientAsync(TcpListener listener, X509Certificate2 cert, VirtualIPConfig config, CancellationToken ct)
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    Console.WriteLine("等待控制连接...");
+                    var controlTcp = await listener.AcceptTcpClientAsync(ct);
+                    controlTcp.NoDelay = true;
+                    var controlSsl = new SslStream(controlTcp.GetStream(), false);
+                    await controlSsl.AuthenticateAsServerAsync(cert, false, false);
+                    Console.WriteLine($"控制连接来自 {controlTcp.Client.RemoteEndPoint}");
+
+                    Console.WriteLine("等待TX数据连接...");
+                    var txTcp = await listener.AcceptTcpClientAsync(ct);
+                    txTcp.NoDelay = true;
+                    var txSsl = new SslStream(txTcp.GetStream(), false);
+                    await txSsl.AuthenticateAsServerAsync(cert, false, false);
+                    Console.WriteLine($"TX数据连接来自 {txTcp.Client.RemoteEndPoint}");
+
+                    Console.WriteLine("等待RX数据连接...");
+                    var rxTcp = await listener.AcceptTcpClientAsync(ct);
+                    rxTcp.NoDelay = true;
+                    var rxSsl = new SslStream(rxTcp.GetStream(), false);
+                    await rxSsl.AuthenticateAsServerAsync(cert, false, false);
+                    Console.WriteLine($"RX数据连接来自 {rxTcp.Client.RemoteEndPoint}");
+
+                    bool authenticated = false;
+                    try
+                    {
+                        Console.WriteLine("[AUTH] 等待客户端认证...");
+                        authenticated = await AuthenticateClientAsync(controlSsl, config, ct);
+                        await SendAsync(controlSsl, Encoding.UTF8.GetBytes(authenticated ? "Success" : "Failed"), ct);
+                        Console.WriteLine($"[AUTH] 已返回认证结果: {(authenticated ? "Success" : "Failed")}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"认证异常: {ex.Message}");
+                    }
+
+                    if (authenticated)
+                    {
+                        Console.WriteLine($"认证成功: {config.ClientID}");
+                        return (controlTcp, controlSsl, txTcp, txSsl, rxTcp, rxSsl);
+                    }
+
+                    Console.WriteLine("认证失败，等待下一个客户端");
+                    controlSsl.Dispose(); controlTcp.Dispose();
+                    txSsl.Dispose(); txTcp.Dispose();
+                    rxSsl.Dispose(); rxTcp.Dispose();
+                }
+
+                throw new OperationCanceledException(ct);
+            }
+
+            sealed class AuthenticationRequest
+            {
+                public string ClientID { get; set; } = "";
+                public long Timestamp { get; set; }
+                public string Sign { get; set; } = "";
+            }
+
+            static async Task<bool> AuthenticateClientAsync(SslStream controlSsl, VirtualIPConfig config, CancellationToken ct)
+            {
+                using var data = await ReceiveAsync(controlSsl, ct);
+                string json = Encoding.UTF8.GetString(data.Buffer, 0, data.Length);
+                var request = JsonConvert.DeserializeObject<AuthenticationRequest>(json);
+                if (request == null)
+                {
+                    Console.WriteLine("[AUTH] 失败: 请求格式无效");
+                    return false;
+                }
+
+                Console.WriteLine($"[AUTH] 收到认证 ClientID={request.ClientID}, Timestamp={request.Timestamp}");
+
+                if (!string.Equals(request.ClientID, config.ClientID, StringComparison.Ordinal))
+                {
+                    Console.WriteLine($"[AUTH] 失败: ClientID 不匹配，期望={config.ClientID}");
+                    return false;
+                }
+
+                long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                if (Math.Abs(now - request.Timestamp) > 300)
+                {
+                    Console.WriteLine($"[AUTH] 失败: Timestamp 超时，now={now}");
+                    return false;
+                }
+
+                string expectedSign = ComputeSign(config.Secret, request.ClientID, request.Timestamp);
+                if (!FixedTimeHexEquals(expectedSign, request.Sign))
+                {
+                    Console.WriteLine("[AUTH] 失败: Sign 不匹配");
+                    return false;
+                }
+
+                return true;
+            }
+
+            static string ComputeSign(string secret, string clientId, long timestamp)
+            {
+                byte[] key = Encoding.UTF8.GetBytes(secret);
+                byte[] msg = Encoding.UTF8.GetBytes($"{clientId}:{timestamp}");
+                using var hmac = new HMACSHA256(key);
+                return Convert.ToHexString(hmac.ComputeHash(msg));
+            }
+
+            static string GenerateSecret()
+            {
+                return Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+            }
+
+            static bool FixedTimeHexEquals(string expectedHex, string actualHex)
+            {
+                try
+                {
+                    byte[] expected = Convert.FromHexString(expectedHex);
+                    byte[] actual = Convert.FromHexString(actualHex);
+                    return expected.Length == actual.Length
+                        && CryptographicOperations.FixedTimeEquals(expected, actual);
+                }
+                catch (FormatException)
+                {
+                    return false;
+                }
             }
 
             static async Task RawInjectLoop(CancellationToken ct)

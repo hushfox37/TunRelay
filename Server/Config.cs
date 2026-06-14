@@ -5,6 +5,8 @@ public class VirtualIPConfig
     public string VirtualIp { get; set; } = "172.30.98.75";
     public int ListenPort { get; set; } = 12345;
     public int[] Ports { get; set; } = { 19191 };
+    public string ClientID { get; set; } = "";
+    public string Secret { get; set; } = "";
 }
 
 public static class ConfigManager
@@ -24,6 +26,19 @@ public static class ConfigManager
 
         T config = new();
         File.WriteAllText(path, JsonSerializer.Serialize(config, Options));
+        return config;
+    }
+
+    public static void Save<T>(string path, T config)
+    {
+        File.WriteAllText(path, JsonSerializer.Serialize(config, Options));
+    }
+
+    public static T Update<T>(string path, Action<T> update) where T : new()
+    {
+        T config = LoadOrCreate<T>(path);
+        update(config);
+        Save(path, config);
         return config;
     }
 }
