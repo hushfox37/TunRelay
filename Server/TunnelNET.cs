@@ -11,9 +11,9 @@ using Newtonsoft.Json;
 
 namespace VirtualIPServer
 {
-    sealed class TunnelClient : IDisposable
+    sealed class Client : IDisposable
     {
-        public TunnelClient(
+        public Client(
             TcpClient controlTcp,
             SslStream controlSsl,
             TcpClient txTcp,
@@ -56,7 +56,7 @@ namespace VirtualIPServer
             public string Sign { get; set; } = "";
         }
 
-        public static async Task<TunnelClient> AcceptAuthenticatedClientAsync(
+        public static async Task<Client> AcceptAuthenticatedClientAsync(
             TcpListener listener,
             X509Certificate2 cert,
             VirtualIPConfig config,
@@ -85,7 +85,7 @@ namespace VirtualIPServer
                 await rxSsl.AuthenticateAsServerAsync(cert, false, false);
                 Console.WriteLine($"RX数据连接来自 {rxTcp.Client.RemoteEndPoint}");
 
-                var client = new TunnelClient(controlTcp, controlSsl, txTcp, txSsl, rxTcp, rxSsl);
+                var client = new Client(controlTcp, controlSsl, txTcp, txSsl, rxTcp, rxSsl);
                 bool authenticated = false;
                 try
                 {
@@ -198,12 +198,48 @@ namespace VirtualIPServer
             return Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
         }
 
-        public static X509Certificate2 GenerateSelfSignedCertificate()
+        public static X509Certificate2 GenerateSelfSignedCertificate(string serverName)
         {
             using var rsa = RSA.Create(2048);
-            var req = new CertificateRequest("cn=VirtualIPServer", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-            var cert = req.CreateSelfSigned(DateTimeOffset.Now, DateTimeOffset.Now.AddYears(1));
-            return X509CertificateLoader.LoadPkcs12(cert.Export(X509ContentType.Pfx), null);
+
+            var req = new CertificateRequest(
+                "CN=VirtualIPServer",
+                rsa,
+                HashAlgorithmName.SHA256,
+                RSASignaturePadding.Pkcs1);
+
+            if (!string.IsNullOrWhiteSpace(serverName))
+            {
+                var sanBuilder = new SubjectAlternativeNameBuilder();
+                if (IPAddress.TryParse(serverName, out var ipAddress))
+                    sanBuilder.AddIpAddress(ipAddress);
+                else
+                    sanBuilder.AddDnsName(serverName);
+
+                req.CertificateExtensions.Add(sanBuilder.Build());
+            }
+
+            // 服务器认证用途
+            req.CertificateExtensions.Add(
+                new X509EnhancedKeyUsageExtension(
+                    new OidCollection
+                    {
+                new Oid("1.3.6.1.5.5.7.3.1") // Server Authentication
+                    },
+                    false));
+
+            // 数字签名
+            req.CertificateExtensions.Add(
+                new X509KeyUsageExtension(
+                    X509KeyUsageFlags.DigitalSignature |
+                    X509KeyUsageFlags.KeyEncipherment,
+                    false));
+
+            var cert = req.CreateSelfSigned(
+                DateTimeOffset.UtcNow,
+                DateTimeOffset.UtcNow.AddYears(10));
+
+            return cert;
         }
 
         static string ComputeSign(string secret, string clientId, long timestamp)

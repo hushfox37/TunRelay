@@ -39,14 +39,16 @@ namespace VirtualIPServer
             {
                 config.Secret = ServerNet.GenerateSecret();
                 ConfigManager.Save(configPath, config);
-                Console.WriteLine("已生成 Secret 并写入 config.json");
+                Console.WriteLine("已生成 Secret");
+                return;
             }
 
             Console.WriteLine($"配置: TunnelIP={TunnelIP}, ListenPort={ListenPort}, Ports={string.Join(",", ports)}, ClientID={config.ClientID}");
 
-            var cert = ServerNet.GenerateSelfSignedCertificate();
+            var cert = ServerNet.GenerateSelfSignedCertificate(config.ServerIP);
             var listener = new TcpListener(IPAddress.Any, ListenPort);
             listener.Start();
+
             Console.WriteLine($"服务端监听端口 {ListenPort}");
 
             using var cts = new CancellationTokenSource();

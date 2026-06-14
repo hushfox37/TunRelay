@@ -2,8 +2,9 @@ using System.Text.Json;
 
 public class VirtualIPConfig
 {
-    public string VirtualIp { get; set; } = "172.30.98.75";
-    public int ListenPort { get; set; } = 12345;
+    public string ServerIP { get; set; } = "";
+    public int ListenPort { get; set; } = 19192;
+    public string VirtualIp { get; set; } = "";
     public int[] Ports { get; set; } = { 19191 };
     public string ClientID { get; set; } = "";
     public string Secret { get; set; } = "";
