@@ -66,25 +66,48 @@ namespace VirtualIPServer
                 IptablesManager.Remove(tcpPorts, udpPorts);
             };
 
-            using var client = await ServerNet.AcceptAuthenticatedClientAsync(listener, cert, config, cts.Token);
-
-            var json = JsonConvert.SerializeObject(new { TunnelIP, Ports = ports, TcpPorts = tcpPorts, UdpPorts = udpPorts });
-            await ServerNet.SendAsync(client.ControlSsl, Encoding.UTF8.GetBytes(json), cts.Token);
-            Console.WriteLine($"已下发 TunnelIP: {TunnelIP}, Ports: {string.Join(",", ports)}, TcpPorts: {string.Join(",", tcpPorts)}, UdpPorts: {string.Join(",", udpPorts)}");
-
             RawSender.Init();
             IptablesManager.Add(tcpPorts, udpPorts);
             NFQueue.Start(100, TunnelIP, TX_channel, cts.Token);
 
             _ = Task.Run(() => RawInjectLoop(cts.Token), cts.Token);
 
-            Console.WriteLine("开始转发...");
+            while (!cts.IsCancellationRequested)
+            {
+                try
+                {
+                    DrainChannel(TX_channel);
+                    DrainChannel(RX_channel);
 
-            await Task.WhenAll(
-                ReceiveLoopAsync(client.TxSsl, cts.Token),
-                SendLoopAsync(client.RxSsl, cts.Token)
-            );
+                    using var client = await ServerNet.AcceptAuthenticatedClientAsync(listener, cert, config, cts.Token);
+                    using var clientCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
 
+                    var json = JsonConvert.SerializeObject(new { TunnelIP, Ports = ports, TcpPorts = tcpPorts, UdpPorts = udpPorts });
+                    await ServerNet.SendAsync(client.ControlSsl, Encoding.UTF8.GetBytes(json), clientCts.Token);
+                    Console.WriteLine($"已下发 TunnelIP: {TunnelIP}, Ports: {string.Join(",", ports)}, TcpPorts: {string.Join(",", tcpPorts)}, UdpPorts: {string.Join(",", udpPorts)}");
+
+                    Console.WriteLine("开始转发...");
+
+                    var receiveTask = ReceiveLoopAsync(client.TxSsl, clientCts.Token);
+                    var sendTask = SendLoopAsync(client.RxSsl, clientCts.Token);
+
+                    await Task.WhenAny(receiveTask, sendTask);
+                    clientCts.Cancel();
+                    await Task.WhenAll(receiveTask, sendTask);
+
+                    Console.WriteLine("客户端已断开，等待重连...");
+                }
+                catch (OperationCanceledException) when (cts.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"客户端会话异常: {ex.Message}");
+                }
+            }
+
+            IptablesManager.Remove(tcpPorts, udpPorts);
             listener.Stop();
         }
 
@@ -113,6 +136,12 @@ namespace VirtualIPServer
         static int[] NormalizePorts(IEnumerable<int> values)
         {
             return values.Distinct().OrderBy(port => port).ToArray();
+        }
+
+        static void DrainChannel(Channel<PacketBuffer> channel)
+        {
+            while (channel.Reader.TryRead(out var packet))
+                packet.Dispose();
         }
 
         static void ValidatePorts(string name, int[] values)
