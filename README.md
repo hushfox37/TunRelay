@@ -1,6 +1,6 @@
-# VirtualIP
+# TunRelay
 
-VirtualIP is a simple TCP/TLS based virtual IP tunneling tool.
+TunRelay is a simple TCP/TLS based TUN IP tunneling tool.
 
 It runs a Windows client with Wintun and a Linux server with NFQUEUE/iptables.
 The server forwards selected TCP/UDP service ports to the client through an
@@ -13,7 +13,7 @@ encrypted tunnel.
 - Windows client based on Wintun
 - Linux server based on `iptables` and `libnetfilter_queue`
 - Separate TCP and UDP service port configuration
-- Automatic client virtual IP and port configuration delivery
+- Automatic client TUN IP and port configuration delivery
 
 ## Repository Layout
 
@@ -49,15 +49,15 @@ sudo apt install iptables libnetfilter-queue1
 ## Build
 
 ```bash
-dotnet build Client/VirtualIPClient.csproj
-dotnet build Server/VirtualIPServer.csproj
+dotnet build Client/TunRelayClient.csproj
+dotnet build Server/TunRelayServer.csproj
 ```
 
 On Windows PowerShell:
 
 ```powershell
-dotnet build Client\VirtualIPClient.csproj
-dotnet build Server\VirtualIPServer.csproj
+dotnet build Client\TunRelayClient.csproj
+dotnet build Server\TunRelayServer.csproj
 ```
 
 ## Configuration
@@ -71,7 +71,7 @@ file does not exist, it is created with default values.
 {
   "ServerIP": "203.0.113.10",
   "ListenPort": 19192,
-  "VirtualIp": "10.0.0.2",
+  "TunIp": "10.0.0.2",
   "TcpPorts": [19191],
   "UdpPorts": [],
   "ClientID": "client-id-from-client-config",
@@ -83,7 +83,7 @@ Fields:
 
 - `ServerIP`: server address used in the generated TLS certificate
 - `ListenPort`: tunnel listening port
-- `VirtualIp`: virtual IP assigned to the client
+- `TunIp`: TUN IP assigned to the client
 - `TcpPorts`: TCP service ports forwarded to the client
 - `UdpPorts`: UDP service ports forwarded to the client
 - `ClientID`: client identifier allowed to authenticate
@@ -113,7 +113,7 @@ Fields:
 You can also update the client secret with:
 
 ```powershell
-VirtualIPClient.exe --Secret "shared-secret"
+TunRelayClient.exe --Secret "shared-secret"
 ```
 
 ## Run
@@ -121,13 +121,13 @@ VirtualIPClient.exe --Secret "shared-secret"
 Start the server as root:
 
 ```bash
-sudo dotnet run --project Server/VirtualIPServer.csproj
+sudo dotnet run --project Server/TunRelayServer.csproj
 ```
 
 Start the client as Administrator:
 
 ```powershell
-dotnet run --project Client\VirtualIPClient.csproj
+dotnet run --project Client\TunRelayClient.csproj
 ```
 
 For published binaries, run each executable from the directory containing its
@@ -137,7 +137,7 @@ For published binaries, run each executable from the directory containing its
 
 - The server adds iptables rules while running and removes them on shutdown.
 - Stop the server with `Ctrl+C` when possible so cleanup handlers can run.
-- The client creates a Wintun adapter and configures the virtual IP assigned by
+- The client creates a Wintun adapter and configures the TUN IP assigned by
   the server.
 - This project does not distribute Linux `iptables` or `libnetfilter_queue`;
   they must be installed on the target system.

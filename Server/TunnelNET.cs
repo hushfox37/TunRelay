@@ -9,7 +9,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Newtonsoft.Json;
 
-namespace VirtualIPServer
+namespace TunRelayServer
 {
     sealed class Client : IDisposable
     {
@@ -59,7 +59,7 @@ namespace VirtualIPServer
         public static async Task<Client> AcceptAuthenticatedClientAsync(
             TcpListener listener,
             X509Certificate2 cert,
-            VirtualIPConfig config,
+            TunRelayConfig config,
             CancellationToken ct)
         {
             while (!ct.IsCancellationRequested)
@@ -112,7 +112,7 @@ namespace VirtualIPServer
             throw new OperationCanceledException(ct);
         }
 
-        static async Task<bool> AuthenticateClientAsync(SslStream controlSsl, VirtualIPConfig config, CancellationToken ct)
+        static async Task<bool> AuthenticateClientAsync(SslStream controlSsl, TunRelayConfig config, CancellationToken ct)
         {
             using var data = await ReceiveAsync(controlSsl, ct);
             string json = Encoding.UTF8.GetString(data.Buffer, 0, data.Length);
@@ -203,7 +203,7 @@ namespace VirtualIPServer
             using var rsa = RSA.Create(2048);
 
             var req = new CertificateRequest(
-                "CN=VirtualIPServer",
+                "CN=TunRelayServer",
                 rsa,
                 HashAlgorithmName.SHA256,
                 RSASignaturePadding.Pkcs1);

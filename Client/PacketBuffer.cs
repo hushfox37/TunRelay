@@ -1,6 +1,6 @@
 using System.Buffers;
 
-namespace VirtualIPClient
+namespace TunRelayClient
 {
     public sealed class PacketBuffer : IDisposable
     {

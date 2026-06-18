@@ -5,7 +5,7 @@ using Newtonsoft.Json.Linq;
 using System.Security.Cryptography;
 using System.Text;
 
-namespace VirtualIPClient
+namespace TunRelayClient
 {
     class Program
     {
@@ -42,7 +42,7 @@ namespace VirtualIPClient
                     case "--Secret":
                         if (i + 1 < args.Length)
                         {
-                            ConfigManager.Update<VirtualIPConfig>("config.json", config =>
+                            ConfigManager.Update<TunRelayConfig>("config.json", config =>
                             {
                                 config.Secret = args[++i];
                             });
@@ -54,7 +54,7 @@ namespace VirtualIPClient
 
             // 加载配置文件
             const string configPath = "config.json";
-            var config = ConfigManager.LoadOrCreate<VirtualIPConfig>(configPath);
+            var config = ConfigManager.LoadOrCreate<TunRelayConfig>(configPath);
 
             ServerIP = config.ServerIp;
             ServerPort = config.EffectiveServerPort;

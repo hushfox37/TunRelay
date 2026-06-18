@@ -2,7 +2,7 @@ using System.Net;
 using System.Runtime.InteropServices;
 using System.Threading.Channels;
 
-namespace VirtualIPServer
+namespace TunRelayServer
 {
     static class NFQueue
     {

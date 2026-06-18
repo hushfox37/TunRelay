@@ -1,6 +1,6 @@
 using System.Diagnostics;
 
-namespace VirtualIPServer
+namespace TunRelayServer
 {
     static class IptablesManager
     {

@@ -5,7 +5,7 @@ using System.Text;
 using System.Threading.Channels;
 using Newtonsoft.Json;
 
-namespace VirtualIPServer
+namespace TunRelayServer
 {
     class Program
     {
@@ -34,7 +34,7 @@ namespace VirtualIPServer
         static async Task Main(string[] args)
         {
             const string configPath = "config.json";
-            var config = ConfigManager.LoadOrCreate<VirtualIPConfig>(configPath);
+            var config = ConfigManager.LoadOrCreate<TunRelayConfig>(configPath);
             LoadConfig(config);
 
             if (string.IsNullOrWhiteSpace(config.Secret))
@@ -111,16 +111,16 @@ namespace VirtualIPServer
             listener.Stop();
         }
 
-        static void LoadConfig(VirtualIPConfig config)
+        static void LoadConfig(TunRelayConfig config)
         {
-            TunnelIP = config.VirtualIp;
+            TunnelIP = config.TunIp;
             ListenPort = config.ListenPort;
             tcpPorts = NormalizePorts(config.TcpPorts);
             udpPorts = NormalizePorts(config.UdpPorts);
             ports = tcpPorts.Concat(udpPorts).Distinct().OrderBy(port => port).ToArray();
 
             if (string.IsNullOrWhiteSpace(TunnelIP))
-                throw new InvalidOperationException("config.json: VirtualIp 不能为空");
+                throw new InvalidOperationException("config.json: TunIp 不能为空");
             if (ListenPort <= 0 || ListenPort > 65535)
                 throw new InvalidOperationException("config.json: ListenPort 必须是 1-65535");
             if (ports.Length == 0)
