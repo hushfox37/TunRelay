@@ -38,11 +38,7 @@ BenchmarkDotNet.Artifacts/
 *.DotSettings.user
 
 # VS Code
-.vscode/*
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
+.vscode/
 
 # Coverage and test output
 coverage/
@@ -66,5 +62,10 @@ Server/config.json
 .DS_Store
 Thumbs.db
 Desktop.ini
-Server/publish/VirtualIPServer
-Server/publish/VirtualIPServer.pdb
+Server/publish/TunRelayServer
+Server/publish/TunRelayServer.pdb
+
+#publish
+publish.cmd
+Server/public.cmd
+**/[Pp]ublish/

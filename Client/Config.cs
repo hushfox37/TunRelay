@@ -1,7 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-public class VirtualIPConfig
+public class TunRelayConfig
 {
     public string ServerIp { get; set; } = "192.168.192.1";
 

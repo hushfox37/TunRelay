@@ -1,10 +1,12 @@
 using System.Text.Json;
 
-public class VirtualIPConfig
+public class TunRelayConfig
 {
-    public string VirtualIp { get; set; } = "172.30.98.75";
-    public int ListenPort { get; set; } = 12345;
-    public int[] Ports { get; set; } = { 19191 };
+    public string ServerIP { get; set; } = "";
+    public int ListenPort { get; set; } = 19192;
+    public string TunIp { get; set; } = "";
+    public int[] TcpPorts { get; set; } = { 19191 };
+    public int[] UdpPorts { get; set; } = Array.Empty<int>();
     public string ClientID { get; set; } = "";
     public string Secret { get; set; } = "";
 }

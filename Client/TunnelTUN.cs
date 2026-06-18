@@ -7,7 +7,7 @@ using System.Threading.Channels;
 using Microsoft.Win32.SafeHandles;
 
 
-namespace VirtualIPClient
+namespace TunRelayClient
 {
     public static class Protocol
     {
@@ -148,7 +148,7 @@ namespace VirtualIPClient
                 NativeLibrary.GetExport(_lib, "WintunStartSession"));
             var getReadWaitEvent = Marshal.GetDelegateForFunctionPointer<WintunGetReadWaitEventDelegate>(
                 NativeLibrary.GetExport(_lib, "WintunGetReadWaitEvent"));
-            var adapter = createAdapter("Tunnel", "VirtualIP", Guid.NewGuid());
+            var adapter = createAdapter("Tunnel", "TunRelay", Guid.NewGuid());
             // 检查适配器是否创建成功
             if (adapter == IntPtr.Zero)
             {

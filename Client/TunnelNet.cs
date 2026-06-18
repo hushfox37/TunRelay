@@ -1,12 +1,11 @@
-using System.Net;
-using System.Net.Sockets;
-using System.Net.Security;
-using System.Security.Cryptography.X509Certificates;
-using System.Buffers.Binary;
 using System.Buffers;
+using System.Buffers.Binary;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 
-namespace VirtualIPClient
+namespace TunRelayClient
 {
     public class TunnelNet
     {
@@ -18,31 +17,34 @@ namespace VirtualIPClient
         private TcpClient TxConnectionTcp;
         private SslStream RxConnectionSsl;
         private TcpClient RxConnectionTcp;
+
         public TunnelNet(string serverIP, int serverPort)
         {
-            this.ServerIP = serverIP;
-            this.ServerPort = serverPort;
+            ServerIP = serverIP;
+            ServerPort = serverPort;
         }
-        public async Task ConnectAsync()
-        {   // 建立控制连接
-            this.ControlConnectionTcp = new TcpClient();
-            await this.ControlConnectionTcp.ConnectAsync(this.ServerIP, this.ServerPort);
-            this.ControlConnectionTcp.NoDelay = true;
-            this.ControlConnectionSsl = new SslStream(this.ControlConnectionTcp.GetStream(), false, (_, _, _, _) => true, null);
-            await this.ControlConnectionSsl.AuthenticateAsClientAsync(this.ServerIP);
-            // 建立数据连接
-            this.TxConnectionTcp = new TcpClient();
-            await this.TxConnectionTcp.ConnectAsync(this.ServerIP, this.ServerPort);
-            this.TxConnectionTcp.NoDelay = true;
-            this.TxConnectionSsl = new SslStream(this.TxConnectionTcp.GetStream(), false, (_, _, _, _) => true, null);
-            await this.TxConnectionSsl.AuthenticateAsClientAsync(this.ServerIP);
 
-            this.RxConnectionTcp = new TcpClient();
-            await this.RxConnectionTcp.ConnectAsync(this.ServerIP, this.ServerPort);
-            this.RxConnectionTcp.NoDelay = true;
-            this.RxConnectionSsl = new SslStream(this.RxConnectionTcp.GetStream(), false, (_, _, _, _) => true, null);
-            await this.RxConnectionSsl.AuthenticateAsClientAsync(this.ServerIP);
+        public async Task ConnectAsync()
+        {
+            ControlConnectionTcp = new TcpClient();
+            await ControlConnectionTcp.ConnectAsync(ServerIP, ServerPort);
+            ControlConnectionTcp.NoDelay = true;
+            ControlConnectionSsl = new SslStream(ControlConnectionTcp.GetStream(), false, ValidateServerCertificate, null);
+            await ControlConnectionSsl.AuthenticateAsClientAsync(ServerIP);
+
+            TxConnectionTcp = new TcpClient();
+            await TxConnectionTcp.ConnectAsync(ServerIP, ServerPort);
+            TxConnectionTcp.NoDelay = true;
+            TxConnectionSsl = new SslStream(TxConnectionTcp.GetStream(), false, ValidateServerCertificate, null);
+            await TxConnectionSsl.AuthenticateAsClientAsync(ServerIP);
+
+            RxConnectionTcp = new TcpClient();
+            await RxConnectionTcp.ConnectAsync(ServerIP, ServerPort);
+            RxConnectionTcp.NoDelay = true;
+            RxConnectionSsl = new SslStream(RxConnectionTcp.GetStream(), false, ValidateServerCertificate, null);
+            await RxConnectionSsl.AuthenticateAsClientAsync(ServerIP);
         }
+
         private async Task SendAsync(ReadOnlyMemory<byte> data, SslStream sslStream, CancellationToken ct = default)
         {
             var buffer = ArrayPool<byte>.Shared.Rent(4 + data.Length);
@@ -57,9 +59,9 @@ namespace VirtualIPClient
                 ArrayPool<byte>.Shared.Return(buffer);
             }
         }
+
         private async Task<PacketBuffer> ReceivePacketAsync(SslStream sslStream, CancellationToken ct = default)
         {
-            // 接收 4 字节长度头
             byte[] lenBuf = ArrayPool<byte>.Shared.Rent(4);
             int totalLen;
             try
@@ -87,35 +89,49 @@ namespace VirtualIPClient
                 throw;
             }
         }
+
+        private bool ValidateServerCertificate(
+            object sender,
+            X509Certificate? certificate,
+            X509Chain? chain,
+            SslPolicyErrors errors)
+        {
+            if (certificate == null)
+                return false;
+
+            // 允许自签证书的链错误，但证书 SAN 必须匹配配置里的 ServerIp。
+            return (errors & ~SslPolicyErrors.RemoteCertificateChainErrors) == SslPolicyErrors.None;
+        }
+
         public async Task SendControlAsync(string data, CancellationToken ct = default)
         {
-            await this.SendAsync(Encoding.UTF8.GetBytes(data), this.ControlConnectionSsl, ct);
+            await SendAsync(Encoding.UTF8.GetBytes(data), ControlConnectionSsl, ct);
         }
 
         public async Task<string> ReceiveControlAsync(CancellationToken ct = default)
         {
-            using var data = await this.ReceivePacketAsync(this.ControlConnectionSsl, ct);
+            using var data = await ReceivePacketAsync(ControlConnectionSsl, ct);
             return Encoding.UTF8.GetString(data.Buffer, 0, data.Length);
         }
 
         public async Task SendDataAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
         {
-            await this.SendAsync(data, this.TxConnectionSsl, ct);
+            await SendAsync(data, TxConnectionSsl, ct);
         }
 
         public async Task<PacketBuffer> ReceiveDataAsync(CancellationToken ct = default)
         {
-            return await this.ReceivePacketAsync(this.RxConnectionSsl, ct);
+            return await ReceivePacketAsync(RxConnectionSsl, ct);
         }
 
         public void Close()
         {
-            this.ControlConnectionSsl?.Dispose();
-            this.ControlConnectionTcp?.Dispose();
-            this.TxConnectionSsl?.Dispose();
-            this.TxConnectionTcp?.Dispose();
-            this.RxConnectionSsl?.Dispose();
-            this.RxConnectionTcp?.Dispose();
+            ControlConnectionSsl?.Dispose();
+            ControlConnectionTcp?.Dispose();
+            TxConnectionSsl?.Dispose();
+            TxConnectionTcp?.Dispose();
+            RxConnectionSsl?.Dispose();
+            RxConnectionTcp?.Dispose();
         }
     }
 }
