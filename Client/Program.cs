@@ -105,7 +105,8 @@ namespace TunRelayClient
             Console.WriteLine($"服务端下发: TunnelIP={TunnelIP}, Ports={string.Join(",", PortConfig)}");
 
             // 启动 TUN 
-            tunnelTUN = new TUN(TunnelIP, PortConfig, RX_channel, TX_channel);
+            ITunDriver driver = TunDriverFactory.Create();
+            tunnelTUN = new TUN(driver, RX_channel, TX_channel);
             await tunnelTUN.StartAsync(TunnelIP, cts.Token);
             _ = Task.Run(() => SendPacketAsync(cts.Token));
             await ReceivePacketAsync(cts.Token);
