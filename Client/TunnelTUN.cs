@@ -43,6 +43,64 @@ namespace TunRelayClient
         public const byte PIM = 0x67;
     }
 
+    internal static class PacketFilter
+    {
+        public static bool ShouldForward(byte[] buffer, int length)
+        {
+            if (length < 20) return false;
+            if (buffer[0] >> 4 != 4) return false;
+            if (buffer[9] != Protocol.TCP && buffer[9] != Protocol.UDP) return false;
+
+            byte d1 = buffer[16], d4 = buffer[19];
+            if (d1 is >= 224 and <= 239 || d4 == 255) return false;
+
+            return true;
+        }
+    }
+
+    internal sealed class PeerRouteTracker
+    {
+        private readonly object _lock = new();
+        private readonly HashSet<uint> _peers = new();
+        private uint _tunnelIp;
+
+        public void SetTunnelIp(uint tunnelIp) => _tunnelIp = tunnelIp;
+
+        public bool TryRegister(byte[] buffer, int length, out string srcIp)
+        {
+            srcIp = "";
+            if (length < 20 || buffer[0] >> 4 != 4) return false;
+
+            uint src = BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(12));
+            uint dst = BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(16));
+            if (dst != _tunnelIp || src == _tunnelIp || src == dst) return false;
+
+            lock (_lock)
+            {
+                if (!_peers.Add(src)) return false;
+            }
+
+            srcIp = FormatIp(src);
+            return true;
+        }
+
+        public static uint ParseIp(string ip)
+        {
+            Span<byte> bytes = stackalloc byte[4];
+            if (!System.Net.IPAddress.TryParse(ip, out var address)
+                || !address.TryWriteBytes(bytes, out int written)
+                || written != 4)
+                throw new InvalidOperationException($"Invalid IPv4 address: {ip}");
+
+            return BinaryPrimitives.ReadUInt32BigEndian(bytes);
+        }
+
+        public static string FormatIp(uint ip)
+        {
+            return $"{(ip >> 24) & 0xff}.{(ip >> 16) & 0xff}.{(ip >> 8) & 0xff}.{ip & 0xff}";
+        }
+    }
+
     public interface ITunDriver : IAsyncDisposable
     {
         Task InitAsync(string ip, CancellationToken ct = default);
@@ -57,7 +115,7 @@ namespace TunRelayClient
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 return new WintunDriver();
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-                return new LinuxunDriver();
+                return new LinuxTunDriver();
 
             throw new PlatformNotSupportedException("Only Windows Wintun and Linux TUN");
         }
@@ -191,8 +249,7 @@ namespace TunRelayClient
         private WintunEndSessionDelegate _endSession = null!;
         private WintunCloseAdapterDelegate _closeAdapter = null!;
 
-        private readonly object _peerRouteLock = new();
-        private readonly HashSet<string> _peerRoutes = new();
+        private readonly PeerRouteTracker _peerRoutes = new();
         private static ILogger? logger => Program.logger;
 
         public uint interfaceIndex { get; private set; }
@@ -250,6 +307,7 @@ namespace TunRelayClient
 
             tunnelIp = ip;
             interfaceIndex = idx;
+            _peerRoutes.SetTunnelIp(PeerRouteTracker.ParseIp(ip));
 
             return Task.CompletedTask;
         }
@@ -278,17 +336,7 @@ namespace TunRelayClient
         {
             await foreach (var packet in ReadPacketsAsync(ct))
             {
-                if (packet.Length < 20
-                    || packet.Buffer[0] >> 4 != 4
-                    || ((packet.Buffer[9] != Protocol.TCP) && (packet.Buffer[9] != Protocol.UDP)))
-                {
-                    packet.Dispose();
-                    continue;
-                }
-
-                byte d1 = packet.Buffer[16];
-                byte d4 = packet.Buffer[19];
-                if (d1 >= 224 && d1 <= 239 || d4 == 255)
+                if (!PacketFilter.ShouldForward(packet.Buffer, packet.Length))
                 {
                     packet.Dispose();
                     continue;
@@ -372,16 +420,7 @@ namespace TunRelayClient
         private void EnsurePeerRoute(PacketBuffer packet)
         {
             if (interfaceIndex == 0) return;
-            if (packet.Length < 20 || packet.Buffer[0] >> 4 != 4) return;
-
-            var src = $"{packet.Buffer[12]}.{packet.Buffer[13]}.{packet.Buffer[14]}.{packet.Buffer[15]}";
-            var dst = $"{packet.Buffer[16]}.{packet.Buffer[17]}.{packet.Buffer[18]}.{packet.Buffer[19]}";
-            if (dst != tunnelIp || src == tunnelIp || src == dst) return;
-
-            lock (_peerRouteLock)
-            {
-                if (!_peerRoutes.Add(src)) return;
-            }
+            if (!_peerRoutes.TryRegister(packet.Buffer, packet.Length, out var src)) return;
 
             var psi = new ProcessStartInfo("route", $"ADD {src} MASK 255.255.255.255 0.0.0.0 METRIC 1 IF {interfaceIndex}")
             {
@@ -437,7 +476,7 @@ namespace TunRelayClient
             return ValueTask.CompletedTask;
         }
     }
-    public class LinuxunDriver : ITunDriver
+    public class LinuxTunDriver : ITunDriver
     {
         static class Libc
         {
@@ -447,152 +486,357 @@ namespace TunRelayClient
             public static extern int open(string path, int flags);
 
             [DllImport(Lib, SetLastError = true)]
-            public static extern int ioctl(int fd, uint request, ref ifreq ifr);
-
-            [DllImport(Lib, SetLastError = true)]
             public static extern int close(int fd);
 
+            [DllImport(Lib, SetLastError = true)]
+            public static extern int read(int fd, byte[] buf, int count);
+
+            [DllImport(Lib, SetLastError = true)]
+            public static extern int write(int fd, byte[] buf, int count);
+
+            [DllImport(Lib, SetLastError = true)]
+            public static extern int fcntl(int fd, int cmd, int arg);
+
+            [DllImport(Lib, SetLastError = true)]
+            public static extern int socket(int domain, int type, int protocol);
+
+            [DllImport(Lib, SetLastError = true)]
+            public static extern int eventfd(uint initval, int flags);
+
+            [DllImport(Lib, SetLastError = true)]
+            public static extern int epoll_create1(int flags);
+
+            [DllImport(Lib, SetLastError = true)]
+            public static extern int epoll_ctl(int epfd, int op, int fd, ref epoll_event ev);
+
+            [DllImport(Lib, SetLastError = true)]
+            public static extern int epoll_wait(int epfd, [Out] epoll_event[] events, int maxevents, int timeout);
+
+            [DllImport(Lib, SetLastError = true)]
+            public static extern int ioctl(int fd, uint request, ref IfReq ifr);
+
+            [DllImport(Lib, SetLastError = true)]
+            public static extern int ioctl(int fd, uint request, ref ifreq_addr ifr);
+
+            [DllImport(Lib, SetLastError = true)]
+            public static extern int ioctl(int fd, uint request, ref ifreq_index ifr);
+
             public const int O_RDWR = 2;
+            public const int F_GETFL = 3;
+            public const int F_SETFL = 4;
+            public const int O_NONBLOCK = 0x800;
+
+            public const int AF_INET = 2;
+            public const int SOCK_DGRAM = 2;
+
             public const uint TUNSETIFF = 0x400454CA;
             public const short IFF_TUN = 0x0001;
             public const short IFF_NO_PI = 0x1000;
+            public const short IFF_UP = 0x0001;
+            public const short IFF_RUNNING = 0x0040;
+
+            public const uint SIOCSIFADDR = 0x8916;
+            public const uint SIOCSIFNETMASK = 0x891C;
+            public const uint SIOCGIFFLAGS = 0x8913;
+            public const uint SIOCSIFFLAGS = 0x8914;
+            public const uint SIOCGIFINDEX = 0x8933;
+
+            public const int EPOLL_CTL_ADD = 1;
+            public const uint EPOLLIN = 0x001;
+
+            public const int EINTR = 4;
+            public const int EAGAIN = 11;
         }
 
         [StructLayout(LayoutKind.Sequential)]
-        struct ifreq
+        struct IfReq
         {
             [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 16)]
-            public string ifr_name;  // 设备名，如 "tun0"
+            public string ifr_name;
             public short ifr_flags;
-            // padding 到 40 字节（ifreq 实际大小）
             [MarshalAs(UnmanagedType.ByValArray, SizeConst = 22)]
             public byte[] padding;
         }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct sockaddr_in
+        {
+            public short sin_family;
+            public ushort sin_port;
+            public uint sin_addr;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+            public byte[] sin_zero;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct ifreq_addr
+        {
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 16)]
+            public string ifr_name;
+            public sockaddr_in addr;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+            public byte[] padding;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct ifreq_index
+        {
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 16)]
+            public string ifr_name;
+            public int ifr_ifindex;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 20)]
+            public byte[] padding;
+        }
+
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        struct epoll_event
+        {
+            public uint events;
+            public ulong data;
+        }
+
+        private const string DeviceName = "Tunnel";
+        private const int MaxPacket = 65535;
+
+        private static readonly byte[] _wake = new byte[8] { 1, 0, 0, 0, 0, 0, 0, 0 };
+
         private int _fd = -1;
-        private FileStream? _stream;
-        private readonly object _peerRouteLock = new();
-        private readonly HashSet<uint> _peerRoutes = new();
+        private int _epfd = -1;
+        private int _eventFd = -1;
         private int _disposed = 0;
-        private uint _tunnelIpUint;
+        private Task? _readLoop;
+        private readonly PeerRouteTracker _peerRoutes = new();
+
+        private static ILogger? logger => Program.logger;
 
         public uint interfaceIndex { get; private set; }
         public string tunnelIp { get; private set; } = "";
 
-        public async Task InitAsync(string ip, CancellationToken ct = default)
+        public Task InitAsync(string ip, CancellationToken ct = default)
         {
             if (_fd >= 0)
                 throw new InvalidOperationException("Already initialized");
 
             _fd = Libc.open("/dev/net/tun", Libc.O_RDWR);
             if (_fd < 0)
-                throw new IOException($"open failed: {Marshal.GetLastWin32Error()}");
+                throw new IOException($"open /dev/net/tun failed: errno={Marshal.GetLastWin32Error()}");
 
-            // 2. 配置 ifreq，绑定名称和模式
-            var ifr = new ifreq
+            try
             {
-                ifr_name = "Tunnel",
-                ifr_flags = Libc.IFF_TUN | Libc.IFF_NO_PI,
-                padding = new byte[22]
-            };
+                var ifr = new IfReq
+                {
+                    ifr_name = DeviceName,
+                    ifr_flags = (short)(Libc.IFF_TUN | Libc.IFF_NO_PI),
+                    padding = new byte[22]
+                };
+                if (Libc.ioctl(_fd, Libc.TUNSETIFF, ref ifr) < 0)
+                    throw new IOException($"ioctl TUNSETIFF failed: errno={Marshal.GetLastWin32Error()}");
 
-            if (Libc.ioctl(_fd, Libc.TUNSETIFF, ref ifr) < 0)
-                throw new IOException($"ioctl TUNSETIFF failed: {Marshal.GetLastWin32Error()}");
+                int flags = Libc.fcntl(_fd, Libc.F_GETFL, 0);
+                if (flags < 0 || Libc.fcntl(_fd, Libc.F_SETFL, flags | Libc.O_NONBLOCK) < 0)
+                    throw new IOException($"fcntl O_NONBLOCK failed: errno={Marshal.GetLastWin32Error()}");
 
-            _stream = new FileStream(
-                new SafeFileHandle((IntPtr)_fd, ownsHandle: true),
-                FileAccess.ReadWrite,
-                bufferSize: 65536,
-                isAsync: false
-            );
+                ConfigureInterface(DeviceName, ip);
 
-            tunnelIp = ip;
-            _tunnelIpUint = IpToUInt32(ip);
+                _eventFd = Libc.eventfd(0, 0);
+                if (_eventFd < 0)
+                    throw new IOException($"eventfd failed: errno={Marshal.GetLastWin32Error()}");
 
-            await RunCommandAsync("ip", $"addr add {ip}/32 dev Tunnel", ct);
-            await RunCommandAsync("ip", "link set Tunnel up", ct);
+                _epfd = Libc.epoll_create1(0);
+                if (_epfd < 0)
+                    throw new IOException($"epoll_create1 failed: errno={Marshal.GetLastWin32Error()}");
 
-            var idxStr = await File.ReadAllTextAsync("/sys/class/net/Tunnel/ifindex", ct);
-            interfaceIndex = uint.Parse(idxStr.Trim());
+                var evTun = new epoll_event { events = Libc.EPOLLIN, data = (ulong)(long)_fd };
+                if (Libc.epoll_ctl(_epfd, Libc.EPOLL_CTL_ADD, _fd, ref evTun) < 0)
+                    throw new IOException($"epoll_ctl tun failed: errno={Marshal.GetLastWin32Error()}");
+
+                var evEvt = new epoll_event { events = Libc.EPOLLIN, data = (ulong)(long)_eventFd };
+                if (Libc.epoll_ctl(_epfd, Libc.EPOLL_CTL_ADD, _eventFd, ref evEvt) < 0)
+                    throw new IOException($"epoll_ctl eventfd failed: errno={Marshal.GetLastWin32Error()}");
+
+                tunnelIp = ip;
+                _peerRoutes.SetTunnelIp(PeerRouteTracker.ParseIp(ip));
+                logger?.LogInformation($"TUN {DeviceName} 已就绪: {ip}/32 ifindex={interfaceIndex}");
+            }
+            catch
+            {
+                Cleanup();
+                throw;
+            }
+
+            return Task.CompletedTask;
         }
 
-        public async Task ReadAsync(Channel<PacketBuffer> channel, CancellationToken ct)
+        private void ConfigureInterface(string name, string ip)
         {
-            while (!ct.IsCancellationRequested)
+            int sock = Libc.socket(Libc.AF_INET, Libc.SOCK_DGRAM, 0);
+            if (sock < 0)
+                throw new IOException($"socket failed: errno={Marshal.GetLastWin32Error()}");
+
+            try
             {
-                PacketBuffer? buf = null;
+                var addrReq = new ifreq_addr
+                {
+                    ifr_name = name,
+                    addr = new sockaddr_in
+                    {
+                        sin_family = Libc.AF_INET,
+                        sin_port = 0,
+                        sin_addr = IpToInAddr(ip),
+                        sin_zero = new byte[8]
+                    },
+                    padding = new byte[8]
+                };
+                if (Libc.ioctl(sock, Libc.SIOCSIFADDR, ref addrReq) < 0)
+                    throw new IOException($"SIOCSIFADDR failed: errno={Marshal.GetLastWin32Error()}");
+
+                var maskReq = new ifreq_addr
+                {
+                    ifr_name = name,
+                    addr = new sockaddr_in
+                    {
+                        sin_family = Libc.AF_INET,
+                        sin_addr = 0xFFFFFFFF,
+                        sin_zero = new byte[8]
+                    },
+                    padding = new byte[8]
+                };
+                if (Libc.ioctl(sock, Libc.SIOCSIFNETMASK, ref maskReq) < 0)
+                    throw new IOException($"SIOCSIFNETMASK failed: errno={Marshal.GetLastWin32Error()}");
+
+                var flagReq = new IfReq { ifr_name = name, padding = new byte[22] };
+                if (Libc.ioctl(sock, Libc.SIOCGIFFLAGS, ref flagReq) < 0)
+                    throw new IOException($"SIOCGIFFLAGS failed: errno={Marshal.GetLastWin32Error()}");
+
+                flagReq.ifr_flags |= (short)(Libc.IFF_UP | Libc.IFF_RUNNING);
+                if (Libc.ioctl(sock, Libc.SIOCSIFFLAGS, ref flagReq) < 0)
+                    throw new IOException($"SIOCSIFFLAGS failed: errno={Marshal.GetLastWin32Error()}");
+
+                var idxReq = new ifreq_index { ifr_name = name, padding = new byte[20] };
+                if (Libc.ioctl(sock, Libc.SIOCGIFINDEX, ref idxReq) < 0)
+                    throw new IOException($"SIOCGIFINDEX failed: errno={Marshal.GetLastWin32Error()}");
+
+                interfaceIndex = (uint)idxReq.ifr_ifindex;
+            }
+            finally
+            {
+                Libc.close(sock);
+            }
+        }
+
+        public Task ReadAsync(Channel<PacketBuffer> channel, CancellationToken ct)
+        {
+            ct.Register(SignalShutdown);
+            _readLoop = Task.Run(() => EpollLoop(channel, ct));
+            return _readLoop;
+        }
+
+        private async Task EpollLoop(Channel<PacketBuffer> channel, CancellationToken ct)
+        {
+            var events = new epoll_event[8];
+
+            while (Volatile.Read(ref _disposed) == 0 && !ct.IsCancellationRequested)
+            {
+                int n = Libc.epoll_wait(_epfd, events, events.Length, -1);
+                if (n < 0)
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    if (err == Libc.EINTR) continue;
+                    logger?.LogWarning($"[READ] epoll_wait failed: errno={err}");
+                    break;
+                }
+
+                bool wake = false, tunReadable = false;
+                for (int i = 0; i < n; i++)
+                {
+                    long s = (long)events[i].data;
+                    if (s == _eventFd) wake = true;
+                    else if (s == _fd) tunReadable = true;
+                }
+
+                if (wake) break;
+                if (tunReadable) await DrainTun(channel, ct);
+            }
+        }
+
+        private async Task DrainTun(Channel<PacketBuffer> channel, CancellationToken ct)
+        {
+            while (Volatile.Read(ref _disposed) == 0 && !ct.IsCancellationRequested)
+            {
+                var buf = PacketBuffer.Rent(MaxPacket);
+                int n = Libc.read(_fd, buf.Buffer, MaxPacket);
+                if (n < 0)
+                {
+                    buf.Dispose();
+                    int err = Marshal.GetLastWin32Error();
+                    if (err == Libc.EAGAIN) return;
+                    if (err == Libc.EINTR) continue;
+                    logger?.LogWarning($"[READ] read failed: errno={err}");
+                    return;
+                }
+
+                if (n == 0)
+                {
+                    buf.Dispose();
+                    return;
+                }
+
+                PacketBuffer packet;
+                if (n < MaxPacket)
+                {
+                    packet = PacketBuffer.Rent(n);
+                    Buffer.BlockCopy(buf.Buffer, 0, packet.Buffer, 0, n);
+                    buf.Dispose();
+                }
+                else
+                {
+                    packet = buf;
+                }
+
+                if (!PacketFilter.ShouldForward(packet.Buffer, packet.Length))
+                {
+                    packet.Dispose();
+                    continue;
+                }
+
                 try
                 {
-                    buf = PacketBuffer.Rent(65535);
-                    int n = await Task.Run(() => _stream!.Read(buf.Buffer, 0, buf.Buffer.Length), ct);
-                    if (n <= 0)
-                    {
-                        buf.Dispose();
-                        buf = null;
-                        continue;
-                    }
-
-                    if (n < buf.Buffer.Length)
-                    {
-                        var exact = PacketBuffer.Rent(n);
-                        Buffer.BlockCopy(buf.Buffer, 0, exact.Buffer, 0, n);
-                        buf.Dispose();
-                        buf = exact;
-                    }
-
-                    if (buf.Length < 20
-                        || buf.Buffer[0] >> 4 != 4
-                        || (buf.Buffer[9] != Protocol.TCP && buf.Buffer[9] != Protocol.UDP))
-                    {
-                        buf.Dispose();
-                        continue;
-                    }
-
-                    byte d1 = buf.Buffer[16], d4 = buf.Buffer[19];
-                    if (d1 is >= 224 and <= 239 || d4 == 255)
-                    {
-                        buf.Dispose();
-                        continue;
-                    }
-
-                    await channel.Writer.WriteAsync(buf, ct);
-                    buf = null;
+                    await channel.Writer.WriteAsync(packet, ct);
                 }
-                catch (OperationCanceledException) { throw; }
-                catch (Exception ex)
+                catch (OperationCanceledException)
                 {
-                    buf?.Dispose();
-                    Console.WriteLine($"[READ] error: {ex.Message}, retrying...");
-                    await Task.Delay(500, ct);
+                    packet.Dispose();
+                    return;
+                }
+                catch
+                {
+                    packet.Dispose();
+                    throw;
                 }
             }
         }
 
         public async Task WriteAsync(PacketBuffer data, CancellationToken ct = default)
         {
-            await EnsurePeerRouteAsync(data, ct);
+            if (interfaceIndex != 0 && _peerRoutes.TryRegister(data.Buffer, data.Length, out var srcIp))
+                await RunCommandAsync("ip", $"route replace {srcIp}/32 dev {DeviceName}", ct);
 
-            await Task.Run(() => _stream!.Write(data.Buffer, 0, data.Length), ct);
-        }
-
-        private async Task EnsurePeerRouteAsync(PacketBuffer packet, CancellationToken ct = default)
-        {
-            if (interfaceIndex == 0) return;
-            if (packet.Length < 20 || packet.Buffer[0] >> 4 != 4) return;
-
-            uint src = BinaryPrimitives.ReadUInt32BigEndian(packet.Buffer.AsSpan(12));
-            uint dst = BinaryPrimitives.ReadUInt32BigEndian(packet.Buffer.AsSpan(16));
-            if (dst != _tunnelIpUint || src == _tunnelIpUint || src == dst) return;
-
-            lock (_peerRouteLock)
+            int written = Libc.write(_fd, data.Buffer, data.Length);
+            if (written < 0)
             {
-                if (!_peerRoutes.Add(src)) return;
+                int err = Marshal.GetLastWin32Error();
+                if (err == Libc.EAGAIN || err == Libc.EINTR) return;
+                logger?.LogWarning($"[WRITE] write failed: errno={err}");
             }
-
-            var srcIp = UInt32ToIp(src);
-            await RunCommandAsync("ip", $"route replace {srcIp}/32 dev Tunnel", ct);
         }
 
-        private static uint IpToUInt32(string ip)
+        private void SignalShutdown()
+        {
+            int fd = _eventFd;
+            if (fd >= 0) Libc.write(fd, _wake, 8);
+        }
+
+        private static uint IpToInAddr(string ip)
         {
             Span<byte> bytes = stackalloc byte[4];
             if (!System.Net.IPAddress.TryParse(ip, out var address)
@@ -600,12 +844,7 @@ namespace TunRelayClient
                 || written != 4)
                 throw new InvalidOperationException($"Invalid IPv4 address: {ip}");
 
-            return BinaryPrimitives.ReadUInt32BigEndian(bytes);
-        }
-
-        private static string UInt32ToIp(uint ip)
-        {
-            return $"{(ip >> 24) & 0xff}.{(ip >> 16) & 0xff}.{(ip >> 8) & 0xff}.{ip & 0xff}";
+            return BinaryPrimitives.ReadUInt32LittleEndian(bytes);
         }
 
         public async ValueTask DisposeAsync()
@@ -613,17 +852,23 @@ namespace TunRelayClient
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
 
-            if (_stream != null)
+            SignalShutdown();
+
+            var loop = _readLoop;
+            if (loop != null)
             {
-                await _stream.DisposeAsync();
-                _stream = null;
-                _fd = -1;
+                try { await loop.ConfigureAwait(false); }
+                catch { }
             }
-            else if (_fd >= 0)
-            {
-                Libc.close(_fd);
-                _fd = -1;
-            }
+
+            Cleanup();
+        }
+
+        private void Cleanup()
+        {
+            if (_epfd >= 0) { Libc.close(_epfd); _epfd = -1; }
+            if (_eventFd >= 0) { Libc.close(_eventFd); _eventFd = -1; }
+            if (_fd >= 0) { Libc.close(_fd); _fd = -1; }
         }
 
         private static async Task RunCommandAsync(string cmd, string args, CancellationToken ct = default)
@@ -639,7 +884,7 @@ namespace TunRelayClient
             using var p = Process.Start(psi)!;
             await p.WaitForExitAsync(ct);
             if (p.ExitCode != 0)
-                Console.WriteLine($"[CMD] {cmd} {args} exit={p.ExitCode}");
+                logger?.LogWarning($"[CMD] {cmd} {args} exit={p.ExitCode}");
         }
     }
 }
