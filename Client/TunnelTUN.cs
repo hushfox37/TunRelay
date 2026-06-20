@@ -5,6 +5,9 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading.Channels;
 using Microsoft.Win32.SafeHandles;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+
 
 namespace TunRelayClient
 {
@@ -190,6 +193,7 @@ namespace TunRelayClient
 
         private readonly object _peerRouteLock = new();
         private readonly HashSet<string> _peerRoutes = new();
+        private static ILogger? logger => Program.logger;
 
         public uint interfaceIndex { get; private set; }
         public string tunnelIp { get; private set; } = "";
@@ -227,7 +231,7 @@ namespace TunRelayClient
             if (_adapter == IntPtr.Zero)
             {
                 int err = Marshal.GetLastWin32Error();
-                throw new InvalidOperationException($"CreateAdapter 失败，错误码: {err}");
+                throw new InvalidOperationException($"CreateAdapter failed, error code: {err}");
             }
 
             getAdapterLUID(_adapter, out ulong LUID);
@@ -237,9 +241,9 @@ namespace TunRelayClient
             uint idx = 0;
             uint indexResult = ConvertInterfaceLuidToIndex(ref netLUID, out idx);
             if (indexResult != 0)
-                Console.WriteLine($"ConvertInterfaceLuidToIndex failed: {indexResult}");
+                logger?.LogWarning($"ConvertInterfaceLuidToIndex failed: {indexResult}");
             else
-                Console.WriteLine($"WinTun interface index: {idx}");
+                logger?.LogInformation($"WinTun interface index: {idx}");
 
             _session = startSession(_adapter, 0x400000);
             _readWaitEvent = getReadWaitEvent(_session);
@@ -265,9 +269,9 @@ namespace TunRelayClient
 
             uint result = AddUnicastIpAddressEntry(ref row);
             if (result != 0)
-                Console.WriteLine($"设置IP失败,错误码: {result}");
+                logger?.LogError($"设置IP失败,错误码: {result}");
             else
-                Console.WriteLine($"IP设置成功: {ip}/{prefixLength}");
+                logger?.LogInformation($"IP设置成功: {ip}/{prefixLength}");
         }
 
         public async Task ReadAsync(Channel<PacketBuffer> channel, CancellationToken ct)
@@ -392,7 +396,7 @@ namespace TunRelayClient
                 using var process = Process.Start(psi);
                 if (process == null)
                 {
-                    Console.WriteLine($"[ROUTE] failed to start route.exe for {src}/32");
+                    logger?.LogDebug($"[ROUTE] failed to start route.exe for {src}/32");
                     return;
                 }
 
@@ -400,13 +404,13 @@ namespace TunRelayClient
                 string output = process.StandardOutput.ReadToEnd();
                 string error = process.StandardError.ReadToEnd();
                 if (process.ExitCode == 0)
-                    Console.WriteLine($"[ROUTE] {src}/32 -> if {interfaceIndex}");
+                    logger?.LogInformation($"[ROUTE] {src}/32 -> if {interfaceIndex}");
                 else
-                    Console.WriteLine($"[ROUTE] failed {src}/32 -> if {interfaceIndex} exit={process.ExitCode} {output}{error}");
+                    logger?.LogInformation($"[ROUTE] failed {src}/32 -> if {interfaceIndex} exit={process.ExitCode} {output}{error}");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ROUTE] exception {src}/32 -> if {interfaceIndex}: {ex.Message}");
+                logger?.LogWarning($"[ROUTE] exception {src}/32 -> if {interfaceIndex}: {ex.Message}");
             }
         }
 

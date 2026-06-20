@@ -9,6 +9,7 @@ public class TunRelayConfig
     public int[] UdpPorts { get; set; } = Array.Empty<int>();
     public string ClientID { get; set; } = "";
     public string Secret { get; set; } = "";
+    public string LogLevel { get; set; } = "Information";
 }
 
 public static class ConfigManager
