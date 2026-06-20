@@ -5,6 +5,8 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading.Channels;
 using Microsoft.Win32.SafeHandles;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 
 namespace TunRelayClient
@@ -130,12 +132,31 @@ namespace TunRelayClient
         public readonly Channel<PacketBuffer> TX_channel;
         private readonly HashSet<int> ServicePorts;
         public string IP;
+        private static ILogger logger;
         public TUN(string ip, IEnumerable<int> servicePorts, Channel<PacketBuffer> rx_channel, Channel<PacketBuffer> tx_channel)
         {
             this.IP = ip;
             this.ServicePorts = servicePorts.ToHashSet();
             this.RX_channel = rx_channel;
             this.TX_channel = tx_channel;
+
+            var services = new ServiceCollection();
+
+            services.AddLogging(builder =>
+            {
+                builder.AddSimpleConsole(options =>
+                {
+                    options.SingleLine = true;
+                    options.TimestampFormat = "yyyy/MM/dd HH:mm:ss ";
+                });
+            });
+
+            using var provider = services.BuildServiceProvider();
+
+            logger = provider
+                .GetRequiredService<ILoggerFactory>()
+                .CreateLogger("");
+
         }
         public async Task StartAsync(string IP, CancellationToken ct = default)
         {
@@ -153,7 +174,7 @@ namespace TunRelayClient
             if (adapter == IntPtr.Zero)
             {
                 int err = Marshal.GetLastWin32Error();
-                Console.WriteLine($"CreateAdapter 失败，错误码: {err}");
+                logger?.LogError($"CreateAdapter 失败，错误码: {err}");
                 return;
             }
 
@@ -167,9 +188,9 @@ namespace TunRelayClient
             uint interfaceIndex = 0;
             uint indexResult = ConvertInterfaceLuidToIndex(ref netLuid, out interfaceIndex);
             if (indexResult != 0)
-                Console.WriteLine($"ConvertInterfaceLuidToIndex failed: {indexResult}");
+                logger?.LogWarning($"ConvertInterfaceLuidToIndex failed: {indexResult}");
             else
-                Console.WriteLine($"WinTun interface index: {interfaceIndex}");
+                logger?.LogInformation($"WinTun interface index: {interfaceIndex}");
 
             //开始会话
             var receivePacket = Marshal.GetDelegateForFunctionPointer<WintunReceivePacketDelegate>(
@@ -208,9 +229,9 @@ namespace TunRelayClient
 
             uint result = AddUnicastIpAddressEntry(ref row);
             if (result != 0)
-                Console.WriteLine($"设置IP失败,错误码: {result}");
+                logger?.LogError($"设置IP失败,错误码: {result}");
             else
-                Console.WriteLine($"IP设置成功: {ip}/{prefixLength}");
+                logger?.LogInformation($"IP设置成功: {ip}/{prefixLength}");
         }
 
         private static async IAsyncEnumerable<PacketBuffer> ReadAsync(
@@ -369,7 +390,7 @@ namespace TunRelayClient
                 using var process = Process.Start(psi);
                 if (process == null)
                 {
-                    Console.WriteLine($"[ROUTE] failed to start route.exe for {src}/32");
+                    logger?.LogDebug($"[ROUTE] failed to start route.exe for {src}/32");
                     return;
                 }
 
@@ -377,13 +398,13 @@ namespace TunRelayClient
                 string output = process.StandardOutput.ReadToEnd();
                 string error = process.StandardError.ReadToEnd();
                 if (process.ExitCode == 0)
-                    Console.WriteLine($"[ROUTE] {src}/32 -> if {interfaceIndex}");
+                    logger?.LogInformation($"[ROUTE] {src}/32 -> if {interfaceIndex}");
                 else
-                    Console.WriteLine($"[ROUTE] failed {src}/32 -> if {interfaceIndex} exit={process.ExitCode} {output}{error}");
+                    logger?.LogInformation($"[ROUTE] failed {src}/32 -> if {interfaceIndex} exit={process.ExitCode} {output}{error}");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ROUTE] exception {src}/32 -> if {interfaceIndex}: {ex.Message}");
+                logger?.LogWarning($"[ROUTE] exception {src}/32 -> if {interfaceIndex}: {ex.Message}");
             }
         }
 

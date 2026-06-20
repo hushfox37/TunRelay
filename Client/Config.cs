@@ -10,6 +10,7 @@ public class TunRelayConfig
     public string ClientID { get; set; } = "";
 
     public string Secret { get; set; } = "";
+    public string LogLevel { get; set; } = "Information";
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? ServerPorts { get; set; }

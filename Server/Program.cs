@@ -4,6 +4,9 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading.Channels;
 using Newtonsoft.Json;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+
 
 namespace TunRelayServer
 {
@@ -25,11 +28,12 @@ namespace TunRelayServer
                 FullMode = BoundedChannelFullMode.Wait
             });
 
-        static string TunnelIP;
-        public static int ListenPort;
-        static int[] tcpPorts;
-        static int[] udpPorts;
-        static int[] ports;
+        private static string TunnelIP;
+        private static int ListenPort;
+        private static int[] tcpPorts;
+        private static int[] udpPorts;
+        private static int[] ports;
+        private static ILogger logger;
 
         static async Task Main(string[] args)
         {
@@ -37,21 +41,49 @@ namespace TunRelayServer
             var config = ConfigManager.LoadOrCreate<TunRelayConfig>(configPath);
             LoadConfig(config);
 
+            //配置日志
+            var services = new ServiceCollection();
+
+            Enum.TryParse<LogLevel>(
+                config.LogLevel,
+                true,
+                out var logLevel);
+
+            services.AddLogging(builder =>
+            {
+                builder.SetMinimumLevel(logLevel);
+
+                builder.AddSimpleConsole(options =>
+                {
+                    options.SingleLine = true;
+                    options.TimestampFormat = "yyyy/MM/dd HH:mm:ss ";
+                });
+            });
+
+            using var provider = services.BuildServiceProvider();
+
+            logger = provider
+                .GetRequiredService<ILoggerFactory>()
+                .CreateLogger("");
+
+            IptablesManager.Init(logger);
+            ServerNet.Init(logger);
+
             if (string.IsNullOrWhiteSpace(config.Secret))
             {
                 config.Secret = ServerNet.GenerateSecret();
                 ConfigManager.Save(configPath, config);
-                Console.WriteLine("已生成 Secret");
+                logger?.LogInformation("已生成 Secret");
                 return;
             }
 
-            Console.WriteLine($"配置: TunnelIP={TunnelIP}, ListenPort={ListenPort}, Ports={string.Join(",", ports)}, TcpPorts={string.Join(",", tcpPorts)}, UdpPorts={string.Join(",", udpPorts)}, ClientID={config.ClientID}");
+            logger?.LogInformation($"配置: TunnelIP={TunnelIP}, ListenPort={ListenPort}, Ports={string.Join(",", ports)}, TcpPorts={string.Join(",", tcpPorts)}, UdpPorts={string.Join(",", udpPorts)}, ClientID={config.ClientID}");
 
             var cert = ServerNet.GenerateSelfSignedCertificate(config.ServerIP);
             var listener = new TcpListener(IPAddress.Any, ListenPort);
             listener.Start();
 
-            Console.WriteLine($"服务端监听端口 {ListenPort}");
+            logger?.LogInformation($"服务端监听端口 {ListenPort}");
 
             using var cts = new CancellationTokenSource();
 
@@ -66,8 +98,10 @@ namespace TunRelayServer
                 IptablesManager.Remove(tcpPorts, udpPorts);
             };
 
-            RawSender.Init();
+            RawSender.Init(logger);
             IptablesManager.Add(tcpPorts, udpPorts);
+            NFQueue.Init(logger);
+
             NFQueue.Start(100, TunnelIP, TX_channel, cts.Token);
 
             _ = Task.Run(() => RawInjectLoop(cts.Token), cts.Token);
@@ -84,9 +118,9 @@ namespace TunRelayServer
 
                     var json = JsonConvert.SerializeObject(new { TunnelIP, Ports = ports, TcpPorts = tcpPorts, UdpPorts = udpPorts });
                     await ServerNet.SendAsync(client.ControlSsl, Encoding.UTF8.GetBytes(json), clientCts.Token);
-                    Console.WriteLine($"已下发 TunnelIP: {TunnelIP}, Ports: {string.Join(",", ports)}, TcpPorts: {string.Join(",", tcpPorts)}, UdpPorts: {string.Join(",", udpPorts)}");
+                    logger?.LogInformation($"已下发 TunnelIP: {TunnelIP}, Ports: {string.Join(",", ports)}, TcpPorts: {string.Join(",", tcpPorts)}, UdpPorts: {string.Join(",", udpPorts)}");
 
-                    Console.WriteLine("开始转发...");
+                    logger?.LogInformation("开始转发...");
 
                     var receiveTask = ReceiveLoopAsync(client.TxSsl, clientCts.Token);
                     var sendTask = SendLoopAsync(client.RxSsl, clientCts.Token);
@@ -95,7 +129,7 @@ namespace TunRelayServer
                     clientCts.Cancel();
                     await Task.WhenAll(receiveTask, sendTask);
 
-                    Console.WriteLine("客户端已断开，等待重连...");
+                    logger?.LogWarning("客户端已断开，等待重连...");
                 }
                 catch (OperationCanceledException) when (cts.IsCancellationRequested)
                 {
@@ -103,7 +137,7 @@ namespace TunRelayServer
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"客户端会话异常: {ex.Message}");
+                    logger?.LogWarning($"客户端会话异常: {ex.Message}");
                 }
             }
 
@@ -130,7 +164,10 @@ namespace TunRelayServer
             ValidatePorts("UdpPorts", udpPorts);
 
             if (string.IsNullOrWhiteSpace(config.ClientID))
+            {
+                logger?.LogError("config.json: ClientID 不能为空");
                 throw new InvalidOperationException("config.json: ClientID 不能为空");
+            }
         }
 
         static int[] NormalizePorts(IEnumerable<int> values)
@@ -147,7 +184,10 @@ namespace TunRelayServer
         static void ValidatePorts(string name, int[] values)
         {
             if (values.Any(port => port <= 0 || port > 65535))
+            {
+                logger?.LogError($"config.json: {name} 必须是 1-65535 的端口列表");
                 throw new InvalidOperationException($"config.json: {name} 必须是 1-65535 的端口列表");
+            }          
         }
 
         static async Task RawInjectLoop(CancellationToken ct)
@@ -172,6 +212,11 @@ namespace TunRelayServer
                     try
                     {
                         await RX_channel.Writer.WriteAsync(data, ct);
+                        if (logger?.IsEnabled(LogLevel.Trace) ?? false)
+                        {
+                            var dump = Convert.ToHexString(data.Buffer);
+                            logger?.LogTrace("[Receive]Packet={Dump}", dump);
+                        }
                     }
                     catch
                     {
@@ -181,7 +226,7 @@ namespace TunRelayServer
                 }
             }
             catch (OperationCanceledException) { }
-            catch (Exception ex) { Console.WriteLine($"数据连接断开(收): {ex.Message}"); }
+            catch (Exception ex) { logger?.LogWarning($"数据连接断开(收): {ex.Message}"); }
         }
 
         static async Task SendLoopAsync(SslStream dataSsl, CancellationToken ct)
@@ -194,11 +239,16 @@ namespace TunRelayServer
                     using (data)
                     {
                         await ServerNet.SendAsync(dataSsl, data.ReadOnlyMemory, ct);
+                        if (logger.IsEnabled(LogLevel.Trace))
+                        {
+                            var dump = Convert.ToHexString(data.Buffer);
+                            logger?.LogTrace("[Send]Packet={Dump}", dump);
+                        }
                     }
                 }
             }
             catch (OperationCanceledException) { }
-            catch (Exception ex) { Console.WriteLine($"数据连接断开(发): {ex.Message}"); }
+            catch (Exception ex) { logger?.LogWarning($"数据连接断开(发): {ex.Message}"); }
         }
     }
 }

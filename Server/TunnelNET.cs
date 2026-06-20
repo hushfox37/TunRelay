@@ -8,6 +8,8 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Newtonsoft.Json;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace TunRelayServer
 {
@@ -49,6 +51,7 @@ namespace TunRelayServer
 
     static class ServerNet
     {
+        static ILogger _logger;
         sealed class AuthenticationRequest
         {
             public string ClientID { get; set; } = "";
@@ -56,6 +59,10 @@ namespace TunRelayServer
             public string Sign { get; set; } = "";
         }
 
+        public static void Init(ILogger logger)
+        {
+            _logger = logger;
+        }
         public static async Task<Client> AcceptAuthenticatedClientAsync(
             TcpListener listener,
             X509Certificate2 cert,
@@ -64,48 +71,48 @@ namespace TunRelayServer
         {
             while (!ct.IsCancellationRequested)
             {
-                Console.WriteLine("等待控制连接...");
+                _logger?.LogInformation("等待控制连接...");
                 var controlTcp = await listener.AcceptTcpClientAsync(ct);
                 controlTcp.NoDelay = true;
                 var controlSsl = new SslStream(controlTcp.GetStream(), false);
                 await controlSsl.AuthenticateAsServerAsync(cert, false, false);
-                Console.WriteLine($"控制连接来自 {controlTcp.Client.RemoteEndPoint}");
+                _logger?.LogInformation($"控制连接来自 {controlTcp.Client.RemoteEndPoint}");
 
-                Console.WriteLine("等待TX数据连接...");
+                _logger?.LogInformation("等待TX数据连接...");
                 var txTcp = await listener.AcceptTcpClientAsync(ct);
                 txTcp.NoDelay = true;
                 var txSsl = new SslStream(txTcp.GetStream(), false);
                 await txSsl.AuthenticateAsServerAsync(cert, false, false);
-                Console.WriteLine($"TX数据连接来自 {txTcp.Client.RemoteEndPoint}");
+                _logger?.LogInformation($"TX数据连接来自 {txTcp.Client.RemoteEndPoint}");
 
-                Console.WriteLine("等待RX数据连接...");
+                _logger?.LogInformation("等待RX数据连接...");
                 var rxTcp = await listener.AcceptTcpClientAsync(ct);
                 rxTcp.NoDelay = true;
                 var rxSsl = new SslStream(rxTcp.GetStream(), false);
                 await rxSsl.AuthenticateAsServerAsync(cert, false, false);
-                Console.WriteLine($"RX数据连接来自 {rxTcp.Client.RemoteEndPoint}");
+                _logger?.LogInformation($"RX数据连接来自 {rxTcp.Client.RemoteEndPoint}");
 
                 var client = new Client(controlTcp, controlSsl, txTcp, txSsl, rxTcp, rxSsl);
                 bool authenticated = false;
                 try
                 {
-                    Console.WriteLine("[AUTH] 等待客户端认证...");
+                    _logger?.LogInformation("[AUTH] 等待客户端认证...");
                     authenticated = await AuthenticateClientAsync(controlSsl, config, ct);
                     await SendAsync(controlSsl, Encoding.UTF8.GetBytes(authenticated ? "Success" : "Failed"), ct);
-                    Console.WriteLine($"[AUTH] 已返回认证结果: {(authenticated ? "Success" : "Failed")}");
+                    _logger?.LogInformation($"[AUTH] 已返回认证结果: {(authenticated ? "Success" : "Failed")}");
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"认证异常: {ex.Message}");
+                    _logger?.LogWarning($"认证异常: {ex.Message}");
                 }
 
                 if (authenticated)
                 {
-                    Console.WriteLine($"认证成功: {config.ClientID}");
+                    _logger?.LogInformation($"认证成功: {config.ClientID}");
                     return client;
                 }
 
-                Console.WriteLine("认证失败，等待下一个客户端");
+                _logger?.LogWarning("认证失败，等待下一个客户端");
                 client.Dispose();
             }
 
@@ -119,29 +126,29 @@ namespace TunRelayServer
             var request = JsonConvert.DeserializeObject<AuthenticationRequest>(json);
             if (request == null)
             {
-                Console.WriteLine("[AUTH] 失败: 请求格式无效");
+                _logger?.LogWarning("[AUTH] 失败: 请求格式无效");
                 return false;
             }
 
-            Console.WriteLine($"[AUTH] 收到认证 ClientID={request.ClientID}, Timestamp={request.Timestamp}");
+            _logger?.LogInformation($"[AUTH] 收到认证 ClientID={request.ClientID}, Timestamp={request.Timestamp}");
 
             if (!string.Equals(request.ClientID, config.ClientID, StringComparison.Ordinal))
             {
-                Console.WriteLine($"[AUTH] 失败: ClientID 不匹配，期望={config.ClientID}");
+                _logger?.LogWarning($"[AUTH] 失败: ClientID 不匹配，期望={config.ClientID}");
                 return false;
             }
 
             long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             if (Math.Abs(now - request.Timestamp) > 300)
             {
-                Console.WriteLine($"[AUTH] 失败: Timestamp 超时，now={now}");
+                _logger?.LogWarning($"[AUTH] 失败: Timestamp 超时，now={now}");
                 return false;
             }
 
             string expectedSign = ComputeSign(config.Secret, request.ClientID, request.Timestamp);
             if (!FixedTimeHexEquals(expectedSign, request.Sign))
             {
-                Console.WriteLine("[AUTH] 失败: Sign 不匹配");
+                _logger?.LogWarning("[AUTH] 失败: Sign 不匹配");
                 return false;
             }
 
@@ -268,6 +275,8 @@ namespace TunRelayServer
 
     static class RawSender
     {
+        static ILogger _logger;
+
         [DllImport("libc.so.6", EntryPoint = "socket")]
         static extern int socket(int domain, int type, int protocol);
 
@@ -289,13 +298,14 @@ namespace TunRelayServer
 
         static int _fd = -1;
 
-        public static void Init()
+        public static void Init(ILogger logger)
         {
+            _logger = logger;
             _fd = socket(2, 3, 255);
             if (_fd < 0) throw new Exception("创建 Raw Socket 失败，需要 root 权限");
             int one = 1;
             setsockopt(_fd, 0, 3, ref one, 4);
-            Console.WriteLine("Raw Socket 已初始化");
+            _logger?.LogInformation("Raw Socket 已初始化");
         }
 
         public static void Send(PacketBuffer packet)
@@ -313,7 +323,7 @@ namespace TunRelayServer
 
             int sent = sendto(_fd, packet.Buffer, packet.Length, 0, ref addr, Marshal.SizeOf<SockAddrIn>());
             if (sent < 0)
-                Console.WriteLine($"[RAW] 发送失败 len={packet.Length}");
+                _logger?.LogWarning($"[RAW] 发送失败 len={packet.Length}");
         }
     }
 }

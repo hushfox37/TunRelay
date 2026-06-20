@@ -1,11 +1,18 @@
 using System.Diagnostics;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace TunRelayServer
 {
     static class IptablesManager
     {
+        
         static bool _cleared;
-
+        static ILogger _logger;
+        public static void Init(ILogger logger)
+        {
+            _logger = logger;
+        }
         static int Run(string args, bool logErrors = true)
         {
             var psi = new ProcessStartInfo("iptables", args)
@@ -17,7 +24,7 @@ namespace TunRelayServer
             using var p = Process.Start(psi)!;
             p.WaitForExit();
             if (p.ExitCode != 0 && logErrors)
-                Console.WriteLine($"iptables {args} failed: {p.StandardError.ReadToEnd()}");
+                _logger?.LogInformation($"iptables {args} failed: {p.StandardError.ReadToEnd()}");
             return p.ExitCode;
         }
 
@@ -46,7 +53,7 @@ namespace TunRelayServer
 
             var portList = string.Join(",", ports);
             Run($"-I INPUT -p {protocol} -m multiport --dports {portList} -j NFQUEUE --queue-num 100");
-            Console.WriteLine($"iptables {protocol} rules added: {portList}");
+            _logger?.LogInformation($"iptables {protocol} rules added: {portList}");
         }
 
         static void RemoveProtocol(string protocol, int[] ports)
@@ -61,7 +68,7 @@ namespace TunRelayServer
             }
 
             if (removed > 0)
-                Console.WriteLine($"iptables {protocol} stale rules removed: {portList} x{removed}");
+                _logger?.LogInformation($"iptables {protocol} stale rules removed: {portList} x{removed}");
         }
 
         static void RemoveStaleCrossProtocolRules(int[] tcpPorts, int[] udpPorts)
