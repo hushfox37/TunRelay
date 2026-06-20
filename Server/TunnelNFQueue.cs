@@ -70,7 +70,10 @@ namespace TunRelayServer
                     if (ShouldForwardToClient(packet, tunnelIpBytes))
                     {
                         if (!txChannel.Writer.TryWrite(packet))
+                        {
                             packet.Dispose();
+                            TunnelStats.IncrementChannelDrops();
+                        }
                     }
                     else
                     {

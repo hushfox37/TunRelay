@@ -12,14 +12,7 @@ namespace TunRelayServer
 {
     class Program
     {
-        public static readonly Channel<PacketBuffer> RX_channel =
-            Channel.CreateBounded<PacketBuffer>(new BoundedChannelOptions(8192)
-            {
-                SingleReader = true,
-                SingleWriter = true,
-                FullMode = BoundedChannelFullMode.Wait
-            });
-
+        // 下行单包入口队列: NFQueue -> batch 编码器。队列满时由生产者 TryWrite 失败丢包(等价 DropWrite)。
         public static readonly Channel<PacketBuffer> TX_channel =
             Channel.CreateBounded<PacketBuffer>(new BoundedChannelOptions(8192)
             {
@@ -33,7 +26,8 @@ namespace TunRelayServer
         private static int[] tcpPorts;
         private static int[] udpPorts;
         private static int[] ports;
-        private static ILogger logger;
+        public static ILogger logger;
+        private static BatchOptions batchOptions;
 
         static async Task Main(string[] args)
         {
@@ -69,6 +63,9 @@ namespace TunRelayServer
             IptablesManager.Init(logger);
             ServerNet.Init(logger);
 
+            batchOptions = new BatchOptions(config.BatchDelayMs, config.MaxBatchBytes, config.MaxBatchPackets);
+            logger?.LogInformation($"数据通道批处理参数: DelayMs={batchOptions.DelayMs}, MaxBytes={batchOptions.MaxBytes}, MaxPackets={batchOptions.MaxPackets}");
+
             if (string.IsNullOrWhiteSpace(config.Secret))
             {
                 config.Secret = ServerNet.GenerateSecret();
@@ -87,6 +84,9 @@ namespace TunRelayServer
 
             using var cts = new CancellationTokenSource();
 
+            // 交互式 stats shell
+            _ = Task.Run(() => ConsoleShell.RunAsync(cts.Token));
+
             Console.CancelKeyPress += (_, e) =>
             {
                 e.Cancel = true;
@@ -104,14 +104,11 @@ namespace TunRelayServer
 
             NFQueue.Start(100, TunnelIP, TX_channel, cts.Token);
 
-            _ = Task.Run(() => RawInjectLoop(cts.Token), cts.Token);
-
             while (!cts.IsCancellationRequested)
             {
                 try
                 {
                     DrainChannel(TX_channel);
-                    DrainChannel(RX_channel);
 
                     using var client = await ServerNet.AcceptAuthenticatedClientAsync(listener, cert, config, cts.Token);
                     using var clientCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
@@ -190,62 +187,26 @@ namespace TunRelayServer
             }          
         }
 
-        static async Task RawInjectLoop(CancellationToken ct)
-        {
-            while (!ct.IsCancellationRequested)
-            {
-                var packet = await RX_channel.Reader.ReadAsync(ct);
-                using (packet)
-                {
-                    RawSender.Send(packet);
-                }
-            }
-        }
-
+        // 下行: TLS Rx 解析 batch -> 直接逐包注入 Raw socket(不再经过 channel)
         static async Task ReceiveLoopAsync(SslStream dataSsl, CancellationToken ct)
         {
             try
             {
-                while (!ct.IsCancellationRequested)
-                {
-                    var data = await ServerNet.ReceiveAsync(dataSsl, ct);
-                    try
-                    {
-                        await RX_channel.Writer.WriteAsync(data, ct);
-                        if (logger?.IsEnabled(LogLevel.Trace) ?? false)
-                        {
-                            var dump = Convert.ToHexString(data.Buffer);
-                            logger?.LogTrace("[Receive]Packet={Dump}", dump);
-                        }
-                    }
-                    catch
-                    {
-                        data.Dispose();
-                        throw;
-                    }
-                }
+                await DataChannel.ReceiveLoopAsync(
+                    dataSsl,
+                    (packet, _) => { RawSender.Send(packet); return ValueTask.CompletedTask; },
+                    ct);
             }
             catch (OperationCanceledException) { }
             catch (Exception ex) { logger?.LogWarning($"数据连接断开(收): {ex.Message}"); }
         }
 
+        // 上行: TX_channel 聚合成 batch -> TLS Tx
         static async Task SendLoopAsync(SslStream dataSsl, CancellationToken ct)
         {
             try
             {
-                while (!ct.IsCancellationRequested)
-                {
-                    var data = await TX_channel.Reader.ReadAsync(ct);
-                    using (data)
-                    {
-                        await ServerNet.SendAsync(dataSsl, data.ReadOnlyMemory, ct);
-                        if (logger.IsEnabled(LogLevel.Trace))
-                        {
-                            var dump = Convert.ToHexString(data.Buffer);
-                            logger?.LogTrace("[Send]Packet={Dump}", dump);
-                        }
-                    }
-                }
+                await DataChannel.SendLoopAsync(TX_channel.Reader, dataSsl, batchOptions, ct);
             }
             catch (OperationCanceledException) { }
             catch (Exception ex) { logger?.LogWarning($"数据连接断开(发): {ex.Message}"); }

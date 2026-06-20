@@ -45,9 +45,9 @@ namespace TunRelayClient
 
     internal static class PacketFilter
     {
-        public static bool ShouldForward(byte[] buffer, int length)
+        public static bool ShouldForward(ReadOnlySpan<byte> buffer)
         {
-            if (length < 20) return false;
+            if (buffer.Length < 20) return false;
             if (buffer[0] >> 4 != 4) return false;
             if (buffer[9] != Protocol.TCP && buffer[9] != Protocol.UDP) return false;
 
@@ -66,13 +66,13 @@ namespace TunRelayClient
 
         public void SetTunnelIp(uint tunnelIp) => _tunnelIp = tunnelIp;
 
-        public bool TryRegister(byte[] buffer, int length, out string srcIp)
+        public bool TryRegister(ReadOnlySpan<byte> buffer, out string srcIp)
         {
             srcIp = "";
-            if (length < 20 || buffer[0] >> 4 != 4) return false;
+            if (buffer.Length < 20 || buffer[0] >> 4 != 4) return false;
 
-            uint src = BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(12));
-            uint dst = BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(16));
+            uint src = BinaryPrimitives.ReadUInt32BigEndian(buffer.Slice(12));
+            uint dst = BinaryPrimitives.ReadUInt32BigEndian(buffer.Slice(16));
             if (dst != _tunnelIp || src == _tunnelIp || src == dst) return false;
 
             lock (_lock)
@@ -105,7 +105,7 @@ namespace TunRelayClient
     {
         Task InitAsync(string ip, CancellationToken ct = default);
         Task ReadAsync(Channel<PacketBuffer> channel, CancellationToken ct);
-        Task WriteAsync(PacketBuffer data, CancellationToken ct = default);
+        Task WriteAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default);
     }
 
     public static class TunDriverFactory
@@ -125,32 +125,24 @@ namespace TunRelayClient
     {
         private readonly ITunDriver Driver;
         public readonly Channel<PacketBuffer> RX_channel;
-        public readonly Channel<PacketBuffer> TX_channel;
 
-        public TUN(ITunDriver driver, Channel<PacketBuffer> rx_channel, Channel<PacketBuffer> tx_channel)
+        public TUN(ITunDriver driver, Channel<PacketBuffer> rx_channel)
         {
             Driver = driver;
             RX_channel = rx_channel;
-            TX_channel = tx_channel;
         }
 
         public async Task StartAsync(string ip, CancellationToken ct = default)
         {
             await Driver.InitAsync(ip, ct);
             _ = Task.Run(() => Driver.ReadAsync(RX_channel, ct), ct);
-            _ = Task.Run(() => ChannelToTunAsync(ct), ct);
         }
 
-        private async Task ChannelToTunAsync(CancellationToken ct)
-        {
-            await foreach (var data in TX_channel.Reader.ReadAllAsync(ct))
-            {
-                using (data)
-                {
-                    await Driver.WriteAsync(data, ct);
-                }
-            }
-        }
+        /// <summary>
+        /// 出口: 直接把单个 IP 包写入 TUN 设备。由接收端 batch 解码循环逐包调用。
+        /// </summary>
+        public Task WriteAsync(ReadOnlyMemory<byte> packet, CancellationToken ct = default)
+            => Driver.WriteAsync(packet, ct);
     }
 
     public class WintunDriver : ITunDriver
@@ -252,6 +244,14 @@ namespace TunRelayClient
         private readonly PeerRouteTracker _peerRoutes = new();
         private static ILogger? logger => Program.logger;
 
+        private readonly Channel<string> _routeQueue = Channel.CreateBounded<string>(
+            new BoundedChannelOptions(256)
+            {
+                FullMode = BoundedChannelFullMode.DropWrite,
+                SingleReader = true
+            });
+        private Task? _routeWorker;
+
         public uint interfaceIndex { get; private set; }
         public string tunnelIp { get; private set; } = "";
 
@@ -309,6 +309,8 @@ namespace TunRelayClient
             interfaceIndex = idx;
             _peerRoutes.SetTunnelIp(PeerRouteTracker.ParseIp(ip));
 
+            _routeWorker = Task.Run(() => RouteWorkerAsync(ct), ct);
+
             return Task.CompletedTask;
         }
 
@@ -336,20 +338,17 @@ namespace TunRelayClient
         {
             await foreach (var packet in ReadPacketsAsync(ct))
             {
-                if (!PacketFilter.ShouldForward(packet.Buffer, packet.Length))
+                if (!PacketFilter.ShouldForward(packet.ReadOnlyMemory.Span))
                 {
                     packet.Dispose();
                     continue;
                 }
 
-                try
-                {
-                    await channel.Writer.WriteAsync(packet, ct);
-                }
-                catch
+                // 队列满则丢弃新包(不阻塞读取线程),并计数
+                if (!channel.Writer.TryWrite(packet))
                 {
                     packet.Dispose();
-                    throw;
+                    TunnelStats.IncrementChannelDrops();
                 }
             }
         }
@@ -397,17 +396,18 @@ namespace TunRelayClient
             }
         }
 
-        public async Task WriteAsync(PacketBuffer data, CancellationToken ct = default)
+        public async Task WriteAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
         {
-            EnsurePeerRoute(data);
+            EnsurePeerRoute(data.Span);
 
+            int len = data.Length;
             int spin = 0;
             while (!ct.IsCancellationRequested)
             {
-                var ptr = _allocateSendPacket(_session, (uint)data.Length);
+                var ptr = _allocateSendPacket(_session, (uint)len);
                 if (ptr != IntPtr.Zero)
                 {
-                    Marshal.Copy(data.Buffer, 0, ptr, data.Length);
+                    CopyToNative(data.Span, ptr);
                     _sendPacket(_session, ptr);
                     return;
                 }
@@ -417,11 +417,34 @@ namespace TunRelayClient
             }
         }
 
-        private void EnsurePeerRoute(PacketBuffer packet)
+        private static unsafe void CopyToNative(ReadOnlySpan<byte> src, IntPtr dst)
+        {
+            var dest = new Span<byte>((void*)dst, src.Length);
+            src.CopyTo(dest);
+        }
+
+        // 出口热路径只做注册判断 + 入队,真正的 route.exe 调用在后台 worker 执行,避免阻塞写包。
+        private void EnsurePeerRoute(ReadOnlySpan<byte> packet)
         {
             if (interfaceIndex == 0) return;
-            if (!_peerRoutes.TryRegister(packet.Buffer, packet.Length, out var src)) return;
+            if (!_peerRoutes.TryRegister(packet, out var src)) return;
 
+            if (_routeQueue.Writer.TryWrite(src))
+                TunnelStats.IncrementRouteUpdatesQueued();
+        }
+
+        private async Task RouteWorkerAsync(CancellationToken ct)
+        {
+            try
+            {
+                await foreach (var src in _routeQueue.Reader.ReadAllAsync(ct))
+                    RunRouteCommand(src);
+            }
+            catch (OperationCanceledException) { }
+        }
+
+        private void RunRouteCommand(string src)
+        {
             var psi = new ProcessStartInfo("route", $"ADD {src} MASK 255.255.255.255 0.0.0.0 METRIC 1 IF {interfaceIndex}")
             {
                 UseShellExecute = false,
@@ -436,6 +459,7 @@ namespace TunRelayClient
                 if (process == null)
                 {
                     logger?.LogDebug($"[ROUTE] failed to start route.exe for {src}/32");
+                    TunnelStats.IncrementRouteUpdateFailures();
                     return;
                 }
 
@@ -445,11 +469,15 @@ namespace TunRelayClient
                 if (process.ExitCode == 0)
                     logger?.LogInformation($"[ROUTE] {src}/32 -> if {interfaceIndex}");
                 else
+                {
                     logger?.LogInformation($"[ROUTE] failed {src}/32 -> if {interfaceIndex} exit={process.ExitCode} {output}{error}");
+                    TunnelStats.IncrementRouteUpdateFailures();
+                }
             }
             catch (Exception ex)
             {
                 logger?.LogWarning($"[ROUTE] exception {src}/32 -> if {interfaceIndex}: {ex.Message}");
+                TunnelStats.IncrementRouteUpdateFailures();
             }
         }
 
@@ -493,6 +521,9 @@ namespace TunRelayClient
 
             [DllImport(Lib, SetLastError = true)]
             public static extern int write(int fd, byte[] buf, int count);
+
+            [DllImport(Lib, SetLastError = true)]
+            public static extern int write(int fd, IntPtr buf, int count);
 
             [DllImport(Lib, SetLastError = true)]
             public static extern int fcntl(int fd, int cmd, int arg);
@@ -605,7 +636,15 @@ namespace TunRelayClient
         private int _eventFd = -1;
         private int _disposed = 0;
         private Task? _readLoop;
+        private Task? _routeWorker;
         private readonly PeerRouteTracker _peerRoutes = new();
+
+        private readonly Channel<string> _routeQueue = Channel.CreateBounded<string>(
+            new BoundedChannelOptions(256)
+            {
+                FullMode = BoundedChannelFullMode.DropWrite,
+                SingleReader = true
+            });
 
         private static ILogger? logger => Program.logger;
 
@@ -656,6 +695,7 @@ namespace TunRelayClient
 
                 tunnelIp = ip;
                 _peerRoutes.SetTunnelIp(PeerRouteTracker.ParseIp(ip));
+                _routeWorker = Task.Run(() => RouteWorkerAsync(ct), ct);
                 logger?.LogInformation($"TUN {DeviceName} 已就绪: {ip}/32 ifindex={interfaceIndex}");
             }
             catch
@@ -781,53 +821,65 @@ namespace TunRelayClient
                     return;
                 }
 
-                PacketBuffer packet;
-                if (n < MaxPacket)
-                {
-                    packet = PacketBuffer.Rent(n);
-                    Buffer.BlockCopy(buf.Buffer, 0, packet.Buffer, 0, n);
-                    buf.Dispose();
-                }
-                else
-                {
-                    packet = buf;
-                }
+                // 直接复用读入的大 buffer,仅设置实际长度,避免二次拷贝
+                buf.SetLength(n);
 
-                if (!PacketFilter.ShouldForward(packet.Buffer, packet.Length))
+                if (!PacketFilter.ShouldForward(buf.ReadOnlyMemory.Span))
                 {
-                    packet.Dispose();
+                    buf.Dispose();
                     continue;
                 }
 
-                try
+                // 队列满则丢弃新包(不阻塞读取线程),并计数
+                if (!channel.Writer.TryWrite(buf))
                 {
-                    await channel.Writer.WriteAsync(packet, ct);
-                }
-                catch (OperationCanceledException)
-                {
-                    packet.Dispose();
-                    return;
-                }
-                catch
-                {
-                    packet.Dispose();
-                    throw;
+                    buf.Dispose();
+                    TunnelStats.IncrementChannelDrops();
                 }
             }
         }
 
-        public async Task WriteAsync(PacketBuffer data, CancellationToken ct = default)
+        public Task WriteAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
         {
-            if (interfaceIndex != 0 && _peerRoutes.TryRegister(data.Buffer, data.Length, out var srcIp))
-                await RunCommandAsync("ip", $"route replace {srcIp}/32 dev {DeviceName}", ct);
+            EnsurePeerRoute(data.Span);
 
-            int written = Libc.write(_fd, data.Buffer, data.Length);
+            int written = WriteToFd(data);
             if (written < 0)
             {
                 int err = Marshal.GetLastWin32Error();
-                if (err == Libc.EAGAIN || err == Libc.EINTR) return;
+                if (err == Libc.EAGAIN || err == Libc.EINTR)
+                    return Task.CompletedTask;
                 logger?.LogWarning($"[WRITE] write failed: errno={err}");
+                TunnelStats.IncrementSinkWriteFailures();
             }
+
+            return Task.CompletedTask;
+        }
+
+        private unsafe int WriteToFd(ReadOnlyMemory<byte> data)
+        {
+            using var handle = data.Pin();
+            return Libc.write(_fd, (IntPtr)handle.Pointer, data.Length);
+        }
+
+        // 出口热路径只做注册判断 + 入队,真正的 ip route 调用在后台 worker 执行,避免阻塞写包。
+        private void EnsurePeerRoute(ReadOnlySpan<byte> packet)
+        {
+            if (interfaceIndex == 0) return;
+            if (!_peerRoutes.TryRegister(packet, out var srcIp)) return;
+
+            if (_routeQueue.Writer.TryWrite(srcIp))
+                TunnelStats.IncrementRouteUpdatesQueued();
+        }
+
+        private async Task RouteWorkerAsync(CancellationToken ct)
+        {
+            try
+            {
+                await foreach (var srcIp in _routeQueue.Reader.ReadAllAsync(ct))
+                    await RunCommandAsync("ip", $"route replace {srcIp}/32 dev {DeviceName}", ct);
+            }
+            catch (OperationCanceledException) { }
         }
 
         private void SignalShutdown()
@@ -884,7 +936,10 @@ namespace TunRelayClient
             using var p = Process.Start(psi)!;
             await p.WaitForExitAsync(ct);
             if (p.ExitCode != 0)
+            {
                 logger?.LogWarning($"[CMD] {cmd} {args} exit={p.ExitCode}");
+                TunnelStats.IncrementRouteUpdateFailures();
+            }
         }
     }
 }

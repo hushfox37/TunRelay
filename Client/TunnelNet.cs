@@ -114,15 +114,9 @@ namespace TunRelayClient
             return Encoding.UTF8.GetString(data.Buffer, 0, data.Length);
         }
 
-        public async Task SendDataAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
-        {
-            await SendAsync(data, TxConnectionSsl, ct);
-        }
-
-        public async Task<PacketBuffer> ReceiveDataAsync(CancellationToken ct = default)
-        {
-            return await ReceivePacketAsync(RxConnectionSsl, ct);
-        }
+        // 数据通道 batch 收发直接基于这两个 SslStream 建立 PipeWriter/PipeReader
+        public Stream TxStream => TxConnectionSsl;
+        public Stream RxStream => RxConnectionSsl;
 
         public void Close()
         {

@@ -11,15 +11,8 @@ namespace TunRelayClient
 {
     class Program
     {
+        // 上行单包入口队列: TUN 读 -> batch 编码器。队列满时由生产者 TryWrite 失败丢包(等价 DropWrite)。
         public static readonly Channel<PacketBuffer> RX_channel =
-            Channel.CreateBounded<PacketBuffer>(new BoundedChannelOptions(4096)
-            {
-                FullMode = BoundedChannelFullMode.Wait,
-                SingleReader = true,
-                SingleWriter = true
-            });
-
-        public static readonly Channel<PacketBuffer> TX_channel =
             Channel.CreateBounded<PacketBuffer>(new BoundedChannelOptions(4096)
             {
                 FullMode = BoundedChannelFullMode.Wait,
@@ -86,6 +79,10 @@ namespace TunRelayClient
                 .GetRequiredService<ILoggerFactory>()
                 .CreateLogger("");
 
+            // 交互式 stats shell
+            using var shellCts = new CancellationTokenSource();
+            _ = Task.Run(() => ConsoleShell.RunAsync(shellCts.Token));
+
             // 合格性检查
             if (string.IsNullOrWhiteSpace(ServerIP))
             {
@@ -143,10 +140,20 @@ namespace TunRelayClient
 
             // 启动 TUN 
             ITunDriver driver = TunDriverFactory.Create();
-            tunnelTUN = new TUN(driver, RX_channel, TX_channel);
+            tunnelTUN = new TUN(driver, RX_channel);
             await tunnelTUN.StartAsync(TunnelIP, cts.Token);
-            _ = Task.Run(() => SendPacketAsync(cts.Token));
-            await ReceivePacketAsync(cts.Token);
+
+            var batchOptions = new BatchOptions(config.BatchDelayMs, config.MaxBatchBytes, config.MaxBatchPackets);
+            logger?.LogInformation($"数据通道批处理参数: DelayMs={batchOptions.DelayMs}, MaxBytes={batchOptions.MaxBytes}, MaxPackets={batchOptions.MaxPackets}");
+
+            // 上行: RX_channel 聚合成 batch -> TLS Tx
+            _ = Task.Run(() => DataChannel.SendLoopAsync(RX_channel.Reader, tunnelNet.TxStream, batchOptions, cts.Token));
+
+            // 下行: TLS Rx 解析 batch -> 直接逐包写入 TUN
+            await DataChannel.ReceiveLoopAsync(
+                tunnelNet.RxStream,
+                (packet, c) => new ValueTask(tunnelTUN.WriteAsync(packet, c)),
+                cts.Token);
         }
 
         static async Task<bool> Authentication(TunnelNet tunnelNet, string secret, string data, CancellationToken ct = default)
@@ -174,44 +181,6 @@ namespace TunRelayClient
                 return false;
             }
             return false;
-        }
-
-        static async Task SendPacketAsync(CancellationToken ct = default)
-        {
-            while (!ct.IsCancellationRequested)
-            {
-                var packet = await RX_channel.Reader.ReadAsync(ct);
-                using (packet)
-                {
-                    await tunnelNet.SendDataAsync(packet.ReadOnlyMemory, ct);
-                    if (logger.IsEnabled(LogLevel.Trace))
-                    {
-                        var dump = Convert.ToHexString(packet.Buffer);
-                        logger?.LogTrace("[Send]Packet={Dump}", dump);
-                    }
-                }
-            }
-        }
-        static async Task ReceivePacketAsync(CancellationToken ct = default)
-        {
-            while (!ct.IsCancellationRequested)
-            {
-                var packet = await tunnelNet.ReceiveDataAsync(ct);
-                try
-                {
-                    await TX_channel.Writer.WriteAsync(packet, ct);
-                    if (logger.IsEnabled(LogLevel.Trace))
-                    {
-                        var dump = Convert.ToHexString(packet.Buffer);
-                        logger?.LogTrace("[Receive]Packet={Dump}", dump);
-                    }
-                }
-                catch
-                {
-                    packet.Dispose();
-                    throw;
-                }
-            }
         }
     }
 }

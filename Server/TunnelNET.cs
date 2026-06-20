@@ -284,7 +284,7 @@ namespace TunRelayServer
         static extern int setsockopt(int sockfd, int level, int optname, ref int optval, uint optlen);
 
         [DllImport("libc.so.6", EntryPoint = "sendto")]
-        static extern int sendto(int sockfd, byte[] buf, int len, int flags, ref SockAddrIn addr, int addrlen);
+        static extern int sendto(int sockfd, IntPtr buf, int len, int flags, ref SockAddrIn addr, int addrlen);
 
         [StructLayout(LayoutKind.Sequential)]
         struct SockAddrIn
@@ -308,11 +308,13 @@ namespace TunRelayServer
             _logger?.LogInformation("Raw Socket 已初始化");
         }
 
-        public static void Send(PacketBuffer packet)
+        public static unsafe void Send(ReadOnlyMemory<byte> packet)
         {
             if (packet.Length < 20) return;
 
-            uint dstAddr = BitConverter.ToUInt32(packet.Buffer, 16);
+            var span = packet.Span;
+            // 取目的 IP(packet[16..20]),保持原始网络字节序写入 sin_addr
+            uint dstAddr = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(16, 4));
             var addr = new SockAddrIn
             {
                 sin_family = 2,
@@ -321,9 +323,15 @@ namespace TunRelayServer
                 sin_zero = new byte[8]
             };
 
-            int sent = sendto(_fd, packet.Buffer, packet.Length, 0, ref addr, Marshal.SizeOf<SockAddrIn>());
+            int sent;
+            using (var handle = packet.Pin())
+                sent = sendto(_fd, (IntPtr)handle.Pointer, packet.Length, 0, ref addr, Marshal.SizeOf<SockAddrIn>());
+
             if (sent < 0)
+            {
                 _logger?.LogWarning($"[RAW] 发送失败 len={packet.Length}");
+                TunnelStats.IncrementSinkWriteFailures();
+            }
         }
     }
 }

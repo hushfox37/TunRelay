@@ -12,6 +12,11 @@ public class TunRelayConfig
     public string Secret { get; set; } = "";
     public string LogLevel { get; set; } = "Information";
 
+    // 数据通道微批处理参数(运行时会做边界归一化)
+    public int BatchDelayMs { get; set; } = 1;
+    public int MaxBatchBytes { get; set; } = 65536;
+    public int MaxBatchPackets { get; set; } = 32;
+
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? ServerPorts { get; set; }
 
