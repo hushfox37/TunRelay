@@ -4,6 +4,7 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using Newtonsoft.Json;
 
 namespace TunRelayClient
 {
@@ -11,12 +12,15 @@ namespace TunRelayClient
     {
         private readonly string ServerIP;
         private readonly int ServerPort;
-        private SslStream ControlConnectionSsl;
-        private TcpClient ControlConnectionTcp;
-        private SslStream TxConnectionSsl;
-        private TcpClient TxConnectionTcp;
-        private SslStream RxConnectionSsl;
-        private TcpClient RxConnectionTcp;
+
+        private SslStream ControlConnectionSsl = null!;
+        private TcpClient ControlConnectionTcp = null!;
+
+        // 多连接: 上行(client->server, role=tx) 与 下行(server->client, role=rx) 各 N 条。
+        private TcpClient[] _txTcp = Array.Empty<TcpClient>();
+        private SslStream[] _txSsl = Array.Empty<SslStream>();
+        private TcpClient[] _rxTcp = Array.Empty<TcpClient>();
+        private SslStream[] _rxSsl = Array.Empty<SslStream>();
 
         public TunnelNet(string serverIP, int serverPort)
         {
@@ -24,25 +28,41 @@ namespace TunRelayClient
             ServerPort = serverPort;
         }
 
-        public async Task ConnectAsync()
+        // 先只建立控制连接,认证 + 接收下发配置(含并行连接数与 sessionId)后再建数据连接。
+        public async Task ConnectControlAsync(CancellationToken ct = default)
         {
             ControlConnectionTcp = new TcpClient();
-            await ControlConnectionTcp.ConnectAsync(ServerIP, ServerPort);
+            await ControlConnectionTcp.ConnectAsync(ServerIP, ServerPort, ct);
             ControlConnectionTcp.NoDelay = true;
             ControlConnectionSsl = new SslStream(ControlConnectionTcp.GetStream(), false, ValidateServerCertificate, null);
             await ControlConnectionSsl.AuthenticateAsClientAsync(ServerIP);
+        }
 
-            TxConnectionTcp = new TcpClient();
-            await TxConnectionTcp.ConnectAsync(ServerIP, ServerPort);
-            TxConnectionTcp.NoDelay = true;
-            TxConnectionSsl = new SslStream(TxConnectionTcp.GetStream(), false, ValidateServerCertificate, null);
-            await TxConnectionSsl.AuthenticateAsClientAsync(ServerIP);
+        // 按服务端下发的数量建立 N 条上行 + N 条下行数据连接,每条先发握手头 {SessionId, Role, Index}。
+        public async Task ConnectDataChannelsAsync(int uplink, int downlink, string sessionId, CancellationToken ct = default)
+        {
+            _txTcp = new TcpClient[uplink];
+            _txSsl = new SslStream[uplink];
+            for (int i = 0; i < uplink; i++)
+                (_txTcp[i], _txSsl[i]) = await ConnectOneDataAsync(sessionId, "tx", i, ct);
 
-            RxConnectionTcp = new TcpClient();
-            await RxConnectionTcp.ConnectAsync(ServerIP, ServerPort);
-            RxConnectionTcp.NoDelay = true;
-            RxConnectionSsl = new SslStream(RxConnectionTcp.GetStream(), false, ValidateServerCertificate, null);
-            await RxConnectionSsl.AuthenticateAsClientAsync(ServerIP);
+            _rxTcp = new TcpClient[downlink];
+            _rxSsl = new SslStream[downlink];
+            for (int i = 0; i < downlink; i++)
+                (_rxTcp[i], _rxSsl[i]) = await ConnectOneDataAsync(sessionId, "rx", i, ct);
+        }
+
+        private async Task<(TcpClient, SslStream)> ConnectOneDataAsync(string sessionId, string role, int index, CancellationToken ct)
+        {
+            var tcp = new TcpClient();
+            await tcp.ConnectAsync(ServerIP, ServerPort, ct);
+            tcp.NoDelay = true;
+            var ssl = new SslStream(tcp.GetStream(), false, ValidateServerCertificate, null);
+            await ssl.AuthenticateAsClientAsync(ServerIP);
+
+            var handshake = JsonConvert.SerializeObject(new { SessionId = sessionId, Role = role, Index = index });
+            await SendAsync(Encoding.UTF8.GetBytes(handshake), ssl, ct);
+            return (tcp, ssl);
         }
 
         private async Task SendAsync(ReadOnlyMemory<byte> data, SslStream sslStream, CancellationToken ct = default)
@@ -114,18 +134,18 @@ namespace TunRelayClient
             return Encoding.UTF8.GetString(data.Buffer, 0, data.Length);
         }
 
-        // 数据通道 batch 收发直接基于这两个 SslStream 建立 PipeWriter/PipeReader
-        public Stream TxStream => TxConnectionSsl;
-        public Stream RxStream => RxConnectionSsl;
+        // 数据通道 batch 收发直接基于这些 SslStream 建立 PipeWriter/PipeReader
+        public Stream[] TxStreams => _txSsl;
+        public Stream[] RxStreams => _rxSsl;
 
         public void Close()
         {
             ControlConnectionSsl?.Dispose();
             ControlConnectionTcp?.Dispose();
-            TxConnectionSsl?.Dispose();
-            TxConnectionTcp?.Dispose();
-            RxConnectionSsl?.Dispose();
-            RxConnectionTcp?.Dispose();
+            foreach (var s in _txSsl) s?.Dispose();
+            foreach (var t in _txTcp) t?.Dispose();
+            foreach (var s in _rxSsl) s?.Dispose();
+            foreach (var t in _rxTcp) t?.Dispose();
         }
     }
 }

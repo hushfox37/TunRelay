@@ -104,7 +104,7 @@ namespace TunRelayClient
     public interface ITunDriver : IAsyncDisposable
     {
         Task InitAsync(string ip, CancellationToken ct = default);
-        Task ReadAsync(Channel<PacketBuffer> channel, CancellationToken ct);
+        Task ReadAsync(Channel<PacketBuffer>[] channels, CancellationToken ct);
         Task WriteAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default);
     }
 
@@ -124,18 +124,18 @@ namespace TunRelayClient
     class TUN
     {
         private readonly ITunDriver Driver;
-        public readonly Channel<PacketBuffer> RX_channel;
+        public readonly Channel<PacketBuffer>[] RX_channels;
 
-        public TUN(ITunDriver driver, Channel<PacketBuffer> rx_channel)
+        public TUN(ITunDriver driver, Channel<PacketBuffer>[] rx_channels)
         {
             Driver = driver;
-            RX_channel = rx_channel;
+            RX_channels = rx_channels;
         }
 
         public async Task StartAsync(string ip, CancellationToken ct = default)
         {
             await Driver.InitAsync(ip, ct);
-            _ = Task.Run(() => Driver.ReadAsync(RX_channel, ct), ct);
+            _ = Task.Run(() => Driver.ReadAsync(RX_channels, ct), ct);
         }
 
         /// <summary>
@@ -334,17 +334,19 @@ namespace TunRelayClient
                 logger?.LogInformation($"IP设置成功: {ip}/{prefixLength}");
         }
 
-        public async Task ReadAsync(Channel<PacketBuffer> channel, CancellationToken ct)
+        public async Task ReadAsync(Channel<PacketBuffer>[] channels, CancellationToken ct)
         {
             await foreach (var packet in ReadPacketsAsync(ct))
             {
-                if (!PacketFilter.ShouldForward(packet.ReadOnlyMemory.Span))
+                var span = packet.ReadOnlyMemory.Span;
+                if (!PacketFilter.ShouldForward(span))
                 {
                     packet.Dispose();
                     continue;
                 }
 
-                // 队列满则丢弃新包(不阻塞读取线程),并计数
+                // 按 5 元组哈希分流到某条上行连接;队列满则丢弃新包(不阻塞读取线程),并计数
+                var channel = channels[FlowHash.Index(span, channels.Length)];
                 if (!channel.Writer.TryWrite(packet))
                 {
                     packet.Dispose();
@@ -764,14 +766,14 @@ namespace TunRelayClient
             }
         }
 
-        public Task ReadAsync(Channel<PacketBuffer> channel, CancellationToken ct)
+        public Task ReadAsync(Channel<PacketBuffer>[] channels, CancellationToken ct)
         {
             ct.Register(SignalShutdown);
-            _readLoop = Task.Run(() => EpollLoop(channel, ct));
+            _readLoop = Task.Run(() => EpollLoop(channels, ct));
             return _readLoop;
         }
 
-        private async Task EpollLoop(Channel<PacketBuffer> channel, CancellationToken ct)
+        private async Task EpollLoop(Channel<PacketBuffer>[] channels, CancellationToken ct)
         {
             var events = new epoll_event[8];
 
@@ -795,11 +797,11 @@ namespace TunRelayClient
                 }
 
                 if (wake) break;
-                if (tunReadable) await DrainTun(channel, ct);
+                if (tunReadable) await DrainTun(channels, ct);
             }
         }
 
-        private async Task DrainTun(Channel<PacketBuffer> channel, CancellationToken ct)
+        private async Task DrainTun(Channel<PacketBuffer>[] channels, CancellationToken ct)
         {
             while (Volatile.Read(ref _disposed) == 0 && !ct.IsCancellationRequested)
             {
@@ -824,13 +826,15 @@ namespace TunRelayClient
                 // 直接复用读入的大 buffer,仅设置实际长度,避免二次拷贝
                 buf.SetLength(n);
 
-                if (!PacketFilter.ShouldForward(buf.ReadOnlyMemory.Span))
+                var span = buf.ReadOnlyMemory.Span;
+                if (!PacketFilter.ShouldForward(span))
                 {
                     buf.Dispose();
                     continue;
                 }
 
-                // 队列满则丢弃新包(不阻塞读取线程),并计数
+                // 按 5 元组哈希分流到某条上行连接;队列满则丢弃新包(不阻塞读取线程),并计数
+                var channel = channels[FlowHash.Index(span, channels.Length)];
                 if (!channel.Writer.TryWrite(buf))
                 {
                     buf.Dispose();

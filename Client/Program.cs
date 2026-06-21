@@ -11,15 +11,6 @@ namespace TunRelayClient
 {
     class Program
     {
-        // 上行单包入口队列: TUN 读 -> batch 编码器。队列满时由生产者 TryWrite 失败丢包(等价 DropWrite)。
-        public static readonly Channel<PacketBuffer> RX_channel =
-            Channel.CreateBounded<PacketBuffer>(new BoundedChannelOptions(4096)
-            {
-                FullMode = BoundedChannelFullMode.Wait,
-                SingleReader = true,
-                SingleWriter = true
-            });
-
         public static string TunnelIP;
         public static string ServerIP;
         public static int ServerPort;
@@ -115,8 +106,8 @@ namespace TunRelayClient
             tunnelNet = new TunnelNet(ServerIP, ServerPort);
 
             logger?.LogInformation("正在连接服务器...");
-            await tunnelNet.ConnectAsync();
-            logger?.LogInformation("服务器连接已建立");
+            await tunnelNet.ConnectControlAsync(cts.Token);
+            logger?.LogInformation("服务器控制连接已建立");
 
             // 服务器身份验证
             if (!await Authentication(tunnelNet, config.Secret, config.ClientID, cts.Token))
@@ -126,7 +117,7 @@ namespace TunRelayClient
             }
             else logger?.LogInformation("认证成功");
 
-            // 接收服务器分配的虚拟IP地址,端口配置
+            // 接收服务器分配的虚拟IP地址、端口配置、并行连接数与 sessionId
             var Data = await tunnelNet.ReceiveControlAsync(cts.Token);
             var json = JObject.Parse(Data);
             TunnelIP = json["TunnelIP"]?.ToString() ?? TunnelIP;
@@ -136,24 +127,65 @@ namespace TunRelayClient
                 PortConfig.Add(port.ToObject<int>());
             }
 
-            logger?.LogInformation($"服务端下发: TunnelIP={TunnelIP}, Ports={string.Join(",", PortConfig)}");
+            int uplink = Math.Clamp(json["UplinkConnections"]?.ToObject<int>() ?? 1, 1, 16);
+            int downlink = Math.Clamp(json["DownlinkConnections"]?.ToObject<int>() ?? 1, 1, 16);
+            string sessionId = json["SessionId"]?.ToString() ?? "";
+            if (string.IsNullOrEmpty(sessionId))
+            {
+                logger?.LogError("服务端未下发 sessionId");
+                throw new InvalidOperationException("服务端未下发 sessionId");
+            }
 
-            // 启动 TUN 
+            logger?.LogInformation($"服务端下发: TunnelIP={TunnelIP}, Ports={string.Join(",", PortConfig)}, Uplink={uplink}, Downlink={downlink}");
+
+            // 建立 N 条上行 + N 条下行数据连接
+            await tunnelNet.ConnectDataChannelsAsync(uplink, downlink, sessionId, cts.Token);
+            logger?.LogInformation($"数据连接已建立: 上行 {uplink} 条, 下行 {downlink} 条");
+
+            // 每条上行连接一个入口队列(TUN 读 -> 按流哈希分流到其中之一)
+            var uplinkChannels = new Channel<PacketBuffer>[uplink];
+            for (int i = 0; i < uplink; i++)
+                uplinkChannels[i] = Channel.CreateBounded<PacketBuffer>(new BoundedChannelOptions(4096)
+                {
+                    FullMode = BoundedChannelFullMode.Wait,
+                    SingleReader = true,
+                    SingleWriter = true
+                });
+
+            // 启动 TUN
             ITunDriver driver = TunDriverFactory.Create();
-            tunnelTUN = new TUN(driver, RX_channel);
+            tunnelTUN = new TUN(driver, uplinkChannels);
             await tunnelTUN.StartAsync(TunnelIP, cts.Token);
 
             var batchOptions = new BatchOptions(config.BatchDelayMs, config.MaxBatchBytes, config.MaxBatchPackets);
             logger?.LogInformation($"数据通道批处理参数: DelayMs={batchOptions.DelayMs}, MaxBytes={batchOptions.MaxBytes}, MaxPackets={batchOptions.MaxPackets}");
 
-            // 上行: RX_channel 聚合成 batch -> TLS Tx
-            _ = Task.Run(() => DataChannel.SendLoopAsync(RX_channel.Reader, tunnelNet.TxStream, batchOptions, cts.Token));
+            var loops = new List<Task>(uplink + downlink);
 
-            // 下行: TLS Rx 解析 batch -> 直接逐包写入 TUN
-            await DataChannel.ReceiveLoopAsync(
-                tunnelNet.RxStream,
-                (packet, c) => new ValueTask(tunnelTUN.WriteAsync(packet, c)),
-                cts.Token);
+            // 上行: 每条连接 uplinkChannels[i] 聚合成 batch -> TLS Tx[i]
+            var txStreams = tunnelNet.TxStreams;
+            for (int i = 0; i < uplink; i++)
+            {
+                int idx = i;
+                loops.Add(Task.Run(() => DataChannel.SendLoopAsync(uplinkChannels[idx].Reader, txStreams[idx], batchOptions, cts.Token)));
+            }
+
+            // 下行: 每条连接 TLS Rx[i] 解析 batch -> 并发逐包写入 TUN
+            var rxStreams = tunnelNet.RxStreams;
+            for (int i = 0; i < downlink; i++)
+            {
+                int idx = i;
+                loops.Add(Task.Run(() => DataChannel.ReceiveLoopAsync(
+                    rxStreams[idx],
+                    (packet, c) => new ValueTask(tunnelTUN.WriteAsync(packet, c)),
+                    cts.Token)));
+            }
+
+            // 原子会话: 任一连接断开则整体收尾
+            await Task.WhenAny(loops);
+            cts.Cancel();
+            try { await Task.WhenAll(loops); } catch { }
+            logger?.LogWarning("数据连接已断开");
         }
 
         static async Task<bool> Authentication(TunnelNet tunnelNet, string secret, string data, CancellationToken ct = default)

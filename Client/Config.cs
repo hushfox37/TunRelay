@@ -3,7 +3,7 @@ using System.Text.Json.Serialization;
 
 public class TunRelayConfig
 {
-    public string ServerIp { get; set; } = "192.168.192.1";
+    public string ServerIp { get; set; } = "";
 
     public int ServerPort { get; set; } = 12345;
 

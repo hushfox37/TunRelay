@@ -49,7 +49,7 @@ namespace TunRelayServer
         {
             _logger = logger;
         }
-        public static void Start(ushort queueNum, string tunnelIp, Channel<PacketBuffer> txChannel, CancellationToken ct)
+        public static void Start(ushort queueNum, string tunnelIp, Channel<PacketBuffer>[] txChannels, CancellationToken ct)
         {
             byte[] tunnelIpBytes = IPAddress.Parse(tunnelIp).GetAddressBytes();
 
@@ -69,7 +69,9 @@ namespace TunRelayServer
 
                     if (ShouldForwardToClient(packet, tunnelIpBytes))
                     {
-                        if (!txChannel.Writer.TryWrite(packet))
+                        // 按 5 元组哈希分流到某条下行连接
+                        var ch = txChannels[FlowHash.Index(packet.ReadOnlyMemory.Span, txChannels.Length)];
+                        if (!ch.Writer.TryWrite(packet))
                         {
                             packet.Dispose();
                             TunnelStats.IncrementChannelDrops();

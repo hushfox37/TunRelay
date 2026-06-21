@@ -12,20 +12,16 @@ namespace TunRelayServer
 {
     class Program
     {
-        // 下行单包入口队列: NFQueue -> batch 编码器。队列满时由生产者 TryWrite 失败丢包(等价 DropWrite)。
-        public static readonly Channel<PacketBuffer> TX_channel =
-            Channel.CreateBounded<PacketBuffer>(new BoundedChannelOptions(8192)
-            {
-                SingleReader = true,
-                SingleWriter = true,
-                FullMode = BoundedChannelFullMode.Wait
-            });
+        // 下行单包入口队列(每条下行连接一个): NFQueue 按流哈希分流写入。满则丢包计数。
+        private static Channel<PacketBuffer>[] _downlinkChannels = Array.Empty<Channel<PacketBuffer>>();
 
         private static string TunnelIP;
         private static int ListenPort;
         private static int[] tcpPorts;
         private static int[] udpPorts;
         private static int[] ports;
+        private static int uplinkConnections;
+        private static int downlinkConnections;
         public static ILogger logger;
         private static BatchOptions batchOptions;
 
@@ -102,29 +98,58 @@ namespace TunRelayServer
             IptablesManager.Add(tcpPorts, udpPorts);
             NFQueue.Init(logger);
 
-            NFQueue.Start(100, TunnelIP, TX_channel, cts.Token);
+            _downlinkChannels = new Channel<PacketBuffer>[downlinkConnections];
+            for (int i = 0; i < downlinkConnections; i++)
+                _downlinkChannels[i] = Channel.CreateBounded<PacketBuffer>(new BoundedChannelOptions(8192)
+                {
+                    SingleReader = true,
+                    SingleWriter = false,
+                    FullMode = BoundedChannelFullMode.Wait
+                });
+
+            NFQueue.Start(100, TunnelIP, _downlinkChannels, cts.Token);
 
             while (!cts.IsCancellationRequested)
             {
+                ControlChannel? control = null;
+                Session? session = null;
                 try
                 {
-                    DrainChannel(TX_channel);
+                    DrainChannels(_downlinkChannels);
 
-                    using var client = await ServerNet.AcceptAuthenticatedClientAsync(listener, cert, config, cts.Token);
+                    control = await ServerNet.AcceptControlAsync(listener, cert, config, cts.Token);
+
+                    var json = JsonConvert.SerializeObject(new
+                    {
+                        TunnelIP,
+                        Ports = ports,
+                        TcpPorts = tcpPorts,
+                        UdpPorts = udpPorts,
+                        UplinkConnections = uplinkConnections,
+                        DownlinkConnections = downlinkConnections,
+                        SessionId = control.SessionId
+                    });
+                    await ServerNet.SendAsync(control.Ssl, Encoding.UTF8.GetBytes(json), cts.Token);
+                    logger?.LogInformation($"已下发配置: TunnelIP={TunnelIP}, Uplink={uplinkConnections}, Downlink={downlinkConnections}");
+
+                    session = await ServerNet.AssembleDataConnectionsAsync(listener, cert, control, uplinkConnections, downlinkConnections, cts.Token);
+                    control = null; // 所有权移交给 session
+
                     using var clientCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
-
-                    var json = JsonConvert.SerializeObject(new { TunnelIP, Ports = ports, TcpPorts = tcpPorts, UdpPorts = udpPorts });
-                    await ServerNet.SendAsync(client.ControlSsl, Encoding.UTF8.GetBytes(json), clientCts.Token);
-                    logger?.LogInformation($"已下发 TunnelIP: {TunnelIP}, Ports: {string.Join(",", ports)}, TcpPorts: {string.Join(",", tcpPorts)}, UdpPorts: {string.Join(",", udpPorts)}");
 
                     logger?.LogInformation("开始转发...");
 
-                    var receiveTask = ReceiveLoopAsync(client.TxSsl, clientCts.Token);
-                    var sendTask = SendLoopAsync(client.RxSsl, clientCts.Token);
+                    var loops = new List<Task>(uplinkConnections + downlinkConnections);
+                    // 上行: server 读 TxSsl[i] -> RawSender
+                    foreach (var tx in session.TxSsl)
+                        loops.Add(ReceiveLoopAsync(tx, clientCts.Token));
+                    // 下行: server 把 downlinkChannels[i] 聚合 -> RxSsl[i]
+                    for (int i = 0; i < session.RxSsl.Length; i++)
+                        loops.Add(SendLoopAsync(session.RxSsl[i], _downlinkChannels[i].Reader, clientCts.Token));
 
-                    await Task.WhenAny(receiveTask, sendTask);
+                    await Task.WhenAny(loops);
                     clientCts.Cancel();
-                    await Task.WhenAll(receiveTask, sendTask);
+                    await Task.WhenAll(loops);
 
                     logger?.LogWarning("客户端已断开，等待重连...");
                 }
@@ -135,6 +160,11 @@ namespace TunRelayServer
                 catch (Exception ex)
                 {
                     logger?.LogWarning($"客户端会话异常: {ex.Message}");
+                }
+                finally
+                {
+                    session?.Dispose();
+                    control?.Dispose();
                 }
             }
 
@@ -149,6 +179,9 @@ namespace TunRelayServer
             tcpPorts = NormalizePorts(config.TcpPorts);
             udpPorts = NormalizePorts(config.UdpPorts);
             ports = tcpPorts.Concat(udpPorts).Distinct().OrderBy(port => port).ToArray();
+
+            uplinkConnections = Math.Clamp(config.UplinkConnections, 1, 16);
+            downlinkConnections = Math.Clamp(config.DownlinkConnections, 1, 16);
 
             if (string.IsNullOrWhiteSpace(TunnelIP))
                 throw new InvalidOperationException("config.json: TunIp 不能为空");
@@ -172,10 +205,11 @@ namespace TunRelayServer
             return values.Distinct().OrderBy(port => port).ToArray();
         }
 
-        static void DrainChannel(Channel<PacketBuffer> channel)
+        static void DrainChannels(Channel<PacketBuffer>[] channels)
         {
-            while (channel.Reader.TryRead(out var packet))
-                packet.Dispose();
+            foreach (var channel in channels)
+                while (channel.Reader.TryRead(out var packet))
+                    packet.Dispose();
         }
 
         static void ValidatePorts(string name, int[] values)
@@ -201,12 +235,12 @@ namespace TunRelayServer
             catch (Exception ex) { logger?.LogWarning($"数据连接断开(收): {ex.Message}"); }
         }
 
-        // 上行: TX_channel 聚合成 batch -> TLS Tx
-        static async Task SendLoopAsync(SslStream dataSsl, CancellationToken ct)
+        // 下行: 指定 channel 聚合成 batch -> TLS 写
+        static async Task SendLoopAsync(SslStream dataSsl, ChannelReader<PacketBuffer> reader, CancellationToken ct)
         {
             try
             {
-                await DataChannel.SendLoopAsync(TX_channel.Reader, dataSsl, batchOptions, ct);
+                await DataChannel.SendLoopAsync(reader, dataSsl, batchOptions, ct);
             }
             catch (OperationCanceledException) { }
             catch (Exception ex) { logger?.LogWarning($"数据连接断开(发): {ex.Message}"); }
