@@ -25,6 +25,16 @@ namespace TunRelayServer
             return new PacketBuffer(ArrayPool<byte>.Shared.Rent(length), length);
         }
 
+        /// <summary>
+        /// 调整有效长度。底层数组容量保持不变(可大于 length),用于"租大 buffer 直接读入,再设置实际长度"的零二次拷贝场景。
+        /// </summary>
+        public void SetLength(int length)
+        {
+            if (length < 0 || length > Buffer.Length)
+                throw new ArgumentOutOfRangeException(nameof(length));
+            Length = length;
+        }
+
         public void Dispose()
         {
             if (disposed) return;

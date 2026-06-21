@@ -1,11 +1,13 @@
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Threading.Channels;
+using Microsoft.Extensions.Logging;
 
 namespace TunRelayServer
 {
     static class NFQueue
     {
+        static ILogger _logger;
         [DllImport("libnetfilter_queue.so.1")]
         static extern IntPtr nfq_open();
 
@@ -43,7 +45,11 @@ namespace TunRelayServer
         static IntPtr _queueHandle;
         static NfqCallback _callback = null!;
 
-        public static void Start(ushort queueNum, string tunnelIp, Channel<PacketBuffer> txChannel, CancellationToken ct)
+        public static void Init(ILogger logger)
+        {
+            _logger = logger;
+        }
+        public static void Start(ushort queueNum, string tunnelIp, Channel<PacketBuffer>[] txChannels, CancellationToken ct)
         {
             byte[] tunnelIpBytes = IPAddress.Parse(tunnelIp).GetAddressBytes();
 
@@ -63,8 +69,13 @@ namespace TunRelayServer
 
                     if (ShouldForwardToClient(packet, tunnelIpBytes))
                     {
-                        if (!txChannel.Writer.TryWrite(packet))
+                        // 按 5 元组哈希分流到某条下行连接
+                        var ch = txChannels[FlowHash.Index(packet.ReadOnlyMemory.Span, txChannels.Length)];
+                        if (!ch.Writer.TryWrite(packet))
+                        {
                             packet.Dispose();
+                            TunnelStats.IncrementChannelDrops();
+                        }
                     }
                     else
                     {
@@ -95,7 +106,7 @@ namespace TunRelayServer
                 }
             }, ct);
 
-            Console.WriteLine($"NFQUEUE {queueNum} 已启动");
+            _logger?.LogInformation($"NFQUEUE {queueNum} 已启动");
         }
 
         static bool ShouldForwardToClient(PacketBuffer packet, byte[] tunnelIp)

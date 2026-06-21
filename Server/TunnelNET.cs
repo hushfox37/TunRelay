@@ -8,47 +8,69 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Newtonsoft.Json;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace TunRelayServer
 {
-    sealed class Client : IDisposable
+    // 已认证控制连接 + 生成的一次性 sessionId
+    sealed class ControlChannel : IDisposable
     {
-        public Client(
-            TcpClient controlTcp,
-            SslStream controlSsl,
-            TcpClient txTcp,
-            SslStream txSsl,
-            TcpClient rxTcp,
-            SslStream rxSsl)
+        public ControlChannel(TcpClient tcp, SslStream ssl, string sessionId)
         {
-            ControlTcp = controlTcp;
-            ControlSsl = controlSsl;
-            TxTcp = txTcp;
-            TxSsl = txSsl;
-            RxTcp = rxTcp;
-            RxSsl = rxSsl;
+            Tcp = tcp;
+            Ssl = ssl;
+            SessionId = sessionId;
         }
 
-        public TcpClient ControlTcp { get; }
-        public SslStream ControlSsl { get; }
-        public TcpClient TxTcp { get; }
-        public SslStream TxSsl { get; }
-        public TcpClient RxTcp { get; }
-        public SslStream RxSsl { get; }
+        public TcpClient Tcp { get; }
+        public SslStream Ssl { get; }
+        public string SessionId { get; }
 
         public void Dispose()
         {
-            ControlSsl.Dispose();
-            ControlTcp.Dispose();
-            TxSsl.Dispose();
-            TxTcp.Dispose();
-            RxSsl.Dispose();
-            RxTcp.Dispose();
+            Ssl.Dispose();
+            Tcp.Dispose();
         }
+    }
+
+    // 一个会话: 控制连接 + N 条上行(client->server, server 读) + N 条下行(server->client, server 写)
+    sealed class Session : IDisposable
+    {
+        public Session(ControlChannel control, SslStream[] txSsl, SslStream[] rxSsl, List<TcpClient> dataTcp, List<SslStream> dataSsl)
+        {
+            Control = control;
+            TxSsl = txSsl;
+            RxSsl = rxSsl;
+            _dataTcp = dataTcp;
+            _dataSsl = dataSsl;
+        }
+
+        public ControlChannel Control { get; }
+        public SslStream[] TxSsl { get; } // 上行: server 读 -> RawSender
+        public SslStream[] RxSsl { get; } // 下行: server 写 <- downlinkChannels
+
+        private readonly List<TcpClient> _dataTcp;
+        private readonly List<SslStream> _dataSsl;
+
+        public void Dispose()
+        {
+            foreach (var s in _dataSsl) s.Dispose();
+            foreach (var t in _dataTcp) t.Dispose();
+            Control.Dispose();
+        }
+    }
+
+    sealed class DataChannelHandshake
+    {
+        public string SessionId { get; set; } = "";
+        public string Role { get; set; } = "";
+        public int Index { get; set; }
     }
 
     static class ServerNet
     {
+        static ILogger _logger;
         sealed class AuthenticationRequest
         {
             public string ClientID { get; set; } = "";
@@ -56,7 +78,13 @@ namespace TunRelayServer
             public string Sign { get; set; } = "";
         }
 
-        public static async Task<Client> AcceptAuthenticatedClientAsync(
+        public static void Init(ILogger logger)
+        {
+            _logger = logger;
+        }
+
+        // 接受一条控制连接并完成认证;成功则生成 sessionId 一并返回。失败则继续等待下一个。
+        public static async Task<ControlChannel> AcceptControlAsync(
             TcpListener listener,
             X509Certificate2 cert,
             TunRelayConfig config,
@@ -64,52 +92,113 @@ namespace TunRelayServer
         {
             while (!ct.IsCancellationRequested)
             {
-                Console.WriteLine("等待控制连接...");
+                _logger?.LogInformation("等待控制连接...");
                 var controlTcp = await listener.AcceptTcpClientAsync(ct);
                 controlTcp.NoDelay = true;
                 var controlSsl = new SslStream(controlTcp.GetStream(), false);
-                await controlSsl.AuthenticateAsServerAsync(cert, false, false);
-                Console.WriteLine($"控制连接来自 {controlTcp.Client.RemoteEndPoint}");
 
-                Console.WriteLine("等待TX数据连接...");
-                var txTcp = await listener.AcceptTcpClientAsync(ct);
-                txTcp.NoDelay = true;
-                var txSsl = new SslStream(txTcp.GetStream(), false);
-                await txSsl.AuthenticateAsServerAsync(cert, false, false);
-                Console.WriteLine($"TX数据连接来自 {txTcp.Client.RemoteEndPoint}");
-
-                Console.WriteLine("等待RX数据连接...");
-                var rxTcp = await listener.AcceptTcpClientAsync(ct);
-                rxTcp.NoDelay = true;
-                var rxSsl = new SslStream(rxTcp.GetStream(), false);
-                await rxSsl.AuthenticateAsServerAsync(cert, false, false);
-                Console.WriteLine($"RX数据连接来自 {rxTcp.Client.RemoteEndPoint}");
-
-                var client = new Client(controlTcp, controlSsl, txTcp, txSsl, rxTcp, rxSsl);
                 bool authenticated = false;
                 try
                 {
-                    Console.WriteLine("[AUTH] 等待客户端认证...");
+                    await controlSsl.AuthenticateAsServerAsync(cert, false, false);
+                    _logger?.LogInformation($"控制连接来自 {controlTcp.Client.RemoteEndPoint}");
+                    _logger?.LogInformation("[AUTH] 等待客户端认证...");
                     authenticated = await AuthenticateClientAsync(controlSsl, config, ct);
                     await SendAsync(controlSsl, Encoding.UTF8.GetBytes(authenticated ? "Success" : "Failed"), ct);
-                    Console.WriteLine($"[AUTH] 已返回认证结果: {(authenticated ? "Success" : "Failed")}");
+                    _logger?.LogInformation($"[AUTH] 已返回认证结果: {(authenticated ? "Success" : "Failed")}");
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"认证异常: {ex.Message}");
+                    _logger?.LogWarning($"认证异常: {ex.Message}");
                 }
 
                 if (authenticated)
                 {
-                    Console.WriteLine($"认证成功: {config.ClientID}");
-                    return client;
+                    _logger?.LogInformation($"认证成功: {config.ClientID}");
+                    string sessionId = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
+                    return new ControlChannel(controlTcp, controlSsl, sessionId);
                 }
 
-                Console.WriteLine("认证失败，等待下一个客户端");
-                client.Dispose();
+                _logger?.LogWarning("认证失败，等待下一个客户端");
+                controlSsl.Dispose();
+                controlTcp.Dispose();
             }
 
             throw new OperationCanceledException(ct);
+        }
+
+        // 组装 N 条上行 + N 条下行数据连接: 每条 TLS 握手后读取 {SessionId, Role, Index},校验 sessionId 后归位。
+        // 带超时;未在期限内集齐则视为失败(抛异常,由上层重来)。
+        public static async Task<Session> AssembleDataConnectionsAsync(
+            TcpListener listener,
+            X509Certificate2 cert,
+            ControlChannel control,
+            int uplink,
+            int downlink,
+            CancellationToken ct)
+        {
+            var txSsl = new SslStream[uplink];
+            var rxSsl = new SslStream[downlink];
+            var dataTcp = new List<TcpClient>(uplink + downlink);
+            var dataSsl = new List<SslStream>(uplink + downlink);
+            int got = 0, need = uplink + downlink;
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(10));
+
+            try
+            {
+                while (got < need)
+                {
+                    var tcp = await listener.AcceptTcpClientAsync(timeoutCts.Token);
+                    tcp.NoDelay = true;
+                    var ssl = new SslStream(tcp.GetStream(), false);
+                    try
+                    {
+                        await ssl.AuthenticateAsServerAsync(cert, false, false);
+                        using var data = await ReceiveAsync(ssl, timeoutCts.Token);
+                        var hs = JsonConvert.DeserializeObject<DataChannelHandshake>(
+                            Encoding.UTF8.GetString(data.Buffer, 0, data.Length));
+
+                        if (hs == null
+                            || !FixedTimeHexEquals(hs.SessionId, control.SessionId)
+                            || hs.Index < 0
+                            || (hs.Role != "tx" && hs.Role != "rx")
+                            || (hs.Role == "tx" && hs.Index >= uplink)
+                            || (hs.Role == "rx" && hs.Index >= downlink)
+                            || (hs.Role == "tx" && txSsl[hs.Index] != null)
+                            || (hs.Role == "rx" && rxSsl[hs.Index] != null))
+                        {
+                            _logger?.LogWarning($"[ASM] 拒绝数据连接 (sessionId/role/index 非法或重复)");
+                            ssl.Dispose();
+                            tcp.Dispose();
+                            continue;
+                        }
+
+                        if (hs.Role == "tx") txSsl[hs.Index] = ssl;
+                        else rxSsl[hs.Index] = ssl;
+                        dataTcp.Add(tcp);
+                        dataSsl.Add(ssl);
+                        got++;
+                        _logger?.LogInformation($"[ASM] 数据连接 {hs.Role}#{hs.Index} 就位 ({got}/{need})");
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        _logger?.LogWarning($"[ASM] 数据连接握手失败: {ex.Message}");
+                        ssl.Dispose();
+                        tcp.Dispose();
+                    }
+                }
+
+                _logger?.LogInformation($"会话已集齐: 上行 {uplink} 条, 下行 {downlink} 条");
+                return new Session(control, txSsl, rxSsl, dataTcp, dataSsl);
+            }
+            catch
+            {
+                foreach (var s in dataSsl) s.Dispose();
+                foreach (var t in dataTcp) t.Dispose();
+                throw;
+            }
         }
 
         static async Task<bool> AuthenticateClientAsync(SslStream controlSsl, TunRelayConfig config, CancellationToken ct)
@@ -119,29 +208,29 @@ namespace TunRelayServer
             var request = JsonConvert.DeserializeObject<AuthenticationRequest>(json);
             if (request == null)
             {
-                Console.WriteLine("[AUTH] 失败: 请求格式无效");
+                _logger?.LogWarning("[AUTH] 失败: 请求格式无效");
                 return false;
             }
 
-            Console.WriteLine($"[AUTH] 收到认证 ClientID={request.ClientID}, Timestamp={request.Timestamp}");
+            _logger?.LogInformation($"[AUTH] 收到认证 ClientID={request.ClientID}, Timestamp={request.Timestamp}");
 
             if (!string.Equals(request.ClientID, config.ClientID, StringComparison.Ordinal))
             {
-                Console.WriteLine($"[AUTH] 失败: ClientID 不匹配，期望={config.ClientID}");
+                _logger?.LogWarning($"[AUTH] 失败: ClientID 不匹配，期望={config.ClientID}");
                 return false;
             }
 
             long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             if (Math.Abs(now - request.Timestamp) > 300)
             {
-                Console.WriteLine($"[AUTH] 失败: Timestamp 超时，now={now}");
+                _logger?.LogWarning($"[AUTH] 失败: Timestamp 超时，now={now}");
                 return false;
             }
 
             string expectedSign = ComputeSign(config.Secret, request.ClientID, request.Timestamp);
             if (!FixedTimeHexEquals(expectedSign, request.Sign))
             {
-                Console.WriteLine("[AUTH] 失败: Sign 不匹配");
+                _logger?.LogWarning("[AUTH] 失败: Sign 不匹配");
                 return false;
             }
 
@@ -268,6 +357,8 @@ namespace TunRelayServer
 
     static class RawSender
     {
+        static ILogger _logger;
+
         [DllImport("libc.so.6", EntryPoint = "socket")]
         static extern int socket(int domain, int type, int protocol);
 
@@ -275,7 +366,7 @@ namespace TunRelayServer
         static extern int setsockopt(int sockfd, int level, int optname, ref int optval, uint optlen);
 
         [DllImport("libc.so.6", EntryPoint = "sendto")]
-        static extern int sendto(int sockfd, byte[] buf, int len, int flags, ref SockAddrIn addr, int addrlen);
+        static extern int sendto(int sockfd, IntPtr buf, int len, int flags, ref SockAddrIn addr, int addrlen);
 
         [StructLayout(LayoutKind.Sequential)]
         struct SockAddrIn
@@ -289,20 +380,23 @@ namespace TunRelayServer
 
         static int _fd = -1;
 
-        public static void Init()
+        public static void Init(ILogger logger)
         {
+            _logger = logger;
             _fd = socket(2, 3, 255);
             if (_fd < 0) throw new Exception("创建 Raw Socket 失败，需要 root 权限");
             int one = 1;
             setsockopt(_fd, 0, 3, ref one, 4);
-            Console.WriteLine("Raw Socket 已初始化");
+            _logger?.LogInformation("Raw Socket 已初始化");
         }
 
-        public static void Send(PacketBuffer packet)
+        public static unsafe void Send(ReadOnlyMemory<byte> packet)
         {
             if (packet.Length < 20) return;
 
-            uint dstAddr = BitConverter.ToUInt32(packet.Buffer, 16);
+            var span = packet.Span;
+            // 取目的 IP(packet[16..20]),保持原始网络字节序写入 sin_addr
+            uint dstAddr = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(16, 4));
             var addr = new SockAddrIn
             {
                 sin_family = 2,
@@ -311,9 +405,15 @@ namespace TunRelayServer
                 sin_zero = new byte[8]
             };
 
-            int sent = sendto(_fd, packet.Buffer, packet.Length, 0, ref addr, Marshal.SizeOf<SockAddrIn>());
+            int sent;
+            using (var handle = packet.Pin())
+                sent = sendto(_fd, (IntPtr)handle.Pointer, packet.Length, 0, ref addr, Marshal.SizeOf<SockAddrIn>());
+
             if (sent < 0)
-                Console.WriteLine($"[RAW] 发送失败 len={packet.Length}");
+            {
+                _logger?.LogWarning($"[RAW] 发送失败 len={packet.Length}");
+                TunnelStats.IncrementSinkWriteFailures();
+            }
         }
     }
 }
