@@ -16,7 +16,9 @@ encrypted tunnel.
 - Separate TCP and UDP service port configuration
 - Automatic client TUN IP and port configuration delivery
 - Batched data channel with runtime tunnel statistics
+- Parallel data connections with stable per-flow routing
 - Configurable console log level
+- Windows/Linux x64/arm64 TUN support with runtime `epoll_event` layout detection
 
 ## Repository Layout
 
@@ -30,7 +32,7 @@ licenses/ Third-party license texts
 
 ### Client
 
-- Windows x64 or Linux x64
+- Windows or Linux
 - .NET 10 SDK or runtime
 - Administrator/root privileges
 - Windows: `wintun.dll` next to the client executable
@@ -64,6 +66,39 @@ dotnet build Client\TunRelayClient.csproj
 dotnet build Server\TunRelayServer.csproj
 ```
 
+Publish runtime-dependent binaries for a specific target runtime:
+
+```bash
+dotnet publish Client/TunRelayClient.csproj -c Release -r linux-x64 --self-contained false
+dotnet publish Client/TunRelayClient.csproj -c Release -r linux-arm64 --self-contained false
+dotnet publish Server/TunRelayServer.csproj -c Release -r linux-x64 --self-contained false
+```
+
+On Windows PowerShell:
+
+```powershell
+dotnet publish Client\TunRelayClient.csproj -c Release -r linux-x64 --self-contained false
+dotnet publish Client\TunRelayClient.csproj -c Release -r linux-arm64 --self-contained false
+dotnet publish Server\TunRelayServer.csproj -c Release -r linux-x64 --self-contained false
+```
+
+Published files are written under `bin/Release/net10.0/<runtime>/publish/`.
+
+Publish self-contained single-file binaries when the target machine may not
+have the matching .NET runtime installed:
+
+```bash
+dotnet publish Client/TunRelayClient.csproj -c Release -r linux-arm64 --self-contained true -p:PublishSingleFile=true -p:DebugType=none -p:DebugSymbols=false
+dotnet publish Server/TunRelayServer.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -p:DebugType=none -p:DebugSymbols=false
+```
+
+On Windows PowerShell:
+
+```powershell
+dotnet publish Client\TunRelayClient.csproj -c Release -r linux-arm64 --self-contained true -p:PublishSingleFile=true -p:DebugType=none -p:DebugSymbols=false
+dotnet publish Server\TunRelayServer.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -p:DebugType=none -p:DebugSymbols=false
+```
+
 ## Configuration
 
 Both programs read `config.json` from their current working directory. If the
@@ -83,7 +118,9 @@ file does not exist, it is created with default values.
   "LogLevel": "Information",
   "BatchDelayMs": 1,
   "MaxBatchBytes": 65536,
-  "MaxBatchPackets": 32
+  "MaxBatchPackets": 32,
+  "UplinkConnections": 4,
+  "DownlinkConnections": 4
 }
 ```
 
@@ -100,6 +137,8 @@ Fields:
 - `BatchDelayMs`: packet batching wait window in milliseconds
 - `MaxBatchBytes`: maximum encoded packet bytes per batch
 - `MaxBatchPackets`: maximum packets per batch
+- `UplinkConnections`: client-to-server data connection count
+- `DownlinkConnections`: server-to-client data connection count
 
 If `Secret` is empty, the server generates one and writes it to `config.json`,
 then exits. Copy that value to the client config.
@@ -123,6 +162,8 @@ Fields:
 
 - `ServerIp`: server address
 - `ServerPort`: server tunnel port
+- `ServerPorts`: optional legacy alias for `ServerPort`; if present, it takes
+  precedence over `ServerPort`
 - `ClientID`: generated automatically if empty
 - `Secret`: shared HMAC secret from the server
 - `LogLevel`: minimum console log level, for example `Information` or `Trace`
@@ -155,18 +196,14 @@ The default values are conservative:
 }
 ```
 
-For throughput testing on high-latency public networks, start with:
+### Parallel connections
 
-```json
-{
-  "BatchDelayMs": 0,
-  "MaxBatchBytes": 262144,
-  "MaxBatchPackets": 128
-}
-```
+The server controls the number of data connections and sends those values to
+the client during the control handshake. `UplinkConnections` and
+`DownlinkConnections` are normalized to `1` through `16` at runtime.
 
-If latency-sensitive traffic becomes less responsive, restore `BatchDelayMs` to
-`1` or lower `MaxBatchPackets`.
+Packets are assigned to a data connection with a stable IPv4 5-tuple flow hash
+so packets from the same TCP/UDP flow stay on the same connection.
 
 ## Run
 
