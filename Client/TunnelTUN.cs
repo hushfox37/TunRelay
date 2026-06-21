@@ -539,11 +539,11 @@ namespace TunRelayClient
             [DllImport(Lib, SetLastError = true)]
             public static extern int epoll_create1(int flags);
 
-            [DllImport(Lib, SetLastError = true)]
-            public static extern int epoll_ctl(int epfd, int op, int fd, ref epoll_event ev);
+            [DllImport(Lib, EntryPoint = "epoll_ctl", SetLastError = true)]
+            public static extern int epoll_ctl(int epfd, int op, int fd, IntPtr ev);
 
-            [DllImport(Lib, SetLastError = true)]
-            public static extern int epoll_wait(int epfd, [Out] epoll_event[] events, int maxevents, int timeout);
+            [DllImport(Lib, EntryPoint = "epoll_wait", SetLastError = true)]
+            public static extern int epoll_wait(int epfd, IntPtr events, int maxevents, int timeout);
 
             [DllImport(Lib, SetLastError = true)]
             public static extern int ioctl(int fd, uint request, ref IfReq ifr);
@@ -621,11 +621,9 @@ namespace TunRelayClient
             public byte[] padding;
         }
 
-        [StructLayout(LayoutKind.Sequential, Pack = 1)]
-        struct epoll_event
+        readonly record struct EpollLayout(int Size, int DataOffset)
         {
-            public uint events;
-            public ulong data;
+            public long EventAddress(IntPtr buffer, int index) => buffer.ToInt64() + (long)index * Size;
         }
 
         private const string DeviceName = "Tunnel";
@@ -637,6 +635,7 @@ namespace TunRelayClient
         private int _epfd = -1;
         private int _eventFd = -1;
         private int _disposed = 0;
+        private EpollLayout _epollLayout;
         private Task? _readLoop;
         private Task? _routeWorker;
         private readonly PeerRouteTracker _peerRoutes = new();
@@ -687,12 +686,13 @@ namespace TunRelayClient
                 if (_epfd < 0)
                     throw new IOException($"epoll_create1 failed: errno={Marshal.GetLastWin32Error()}");
 
-                var evTun = new epoll_event { events = Libc.EPOLLIN, data = (ulong)(long)_fd };
-                if (Libc.epoll_ctl(_epfd, Libc.EPOLL_CTL_ADD, _fd, ref evTun) < 0)
+                _epollLayout = DetectEpollLayout();
+                logger?.LogInformation($"Linux epoll_event layout: size={_epollLayout.Size}, dataOffset={_epollLayout.DataOffset}");
+
+                if (EpollCtlAdd(_fd) < 0)
                     throw new IOException($"epoll_ctl tun failed: errno={Marshal.GetLastWin32Error()}");
 
-                var evEvt = new epoll_event { events = Libc.EPOLLIN, data = (ulong)(long)_eventFd };
-                if (Libc.epoll_ctl(_epfd, Libc.EPOLL_CTL_ADD, _eventFd, ref evEvt) < 0)
+                if (EpollCtlAdd(_eventFd) < 0)
                     throw new IOException($"epoll_ctl eventfd failed: errno={Marshal.GetLastWin32Error()}");
 
                 tunnelIp = ip;
@@ -773,31 +773,111 @@ namespace TunRelayClient
             return _readLoop;
         }
 
+        private static EpollLayout DetectEpollLayout()
+        {
+            var candidates = new[]
+            {
+                new EpollLayout(12, 4),
+                new EpollLayout(16, 8)
+            };
+
+            const long marker = 0x1122334455667788L;
+            byte[] wake = { 1, 0, 0, 0, 0, 0, 0, 0 };
+
+            foreach (var layout in candidates)
+            {
+                int epfd = -1;
+                int eventFd = -1;
+                IntPtr ev = IntPtr.Zero;
+                IntPtr output = IntPtr.Zero;
+
+                try
+                {
+                    epfd = Libc.epoll_create1(0);
+                    eventFd = Libc.eventfd(0, 0);
+                    if (epfd < 0 || eventFd < 0)
+                        continue;
+
+                    ev = AllocEpollEvent(layout, Libc.EPOLLIN, marker);
+                    output = Marshal.AllocHGlobal(layout.Size);
+
+                    if (Libc.epoll_ctl(epfd, Libc.EPOLL_CTL_ADD, eventFd, ev) < 0)
+                        continue;
+
+                    if (Libc.write(eventFd, wake, wake.Length) != wake.Length)
+                        continue;
+
+                    int n = Libc.epoll_wait(epfd, output, 1, 100);
+                    if (n == 1 && Marshal.ReadInt64(output, layout.DataOffset) == marker)
+                        return layout;
+                }
+                finally
+                {
+                    if (output != IntPtr.Zero) Marshal.FreeHGlobal(output);
+                    if (ev != IntPtr.Zero) Marshal.FreeHGlobal(ev);
+                    if (eventFd >= 0) Libc.close(eventFd);
+                    if (epfd >= 0) Libc.close(epfd);
+                }
+            }
+
+            throw new PlatformNotSupportedException("Unsupported Linux epoll_event layout");
+        }
+
+        private int EpollCtlAdd(int fd)
+        {
+            IntPtr ev = AllocEpollEvent(_epollLayout, Libc.EPOLLIN, fd);
+            try
+            {
+                return Libc.epoll_ctl(_epfd, Libc.EPOLL_CTL_ADD, fd, ev);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(ev);
+            }
+        }
+
+        private static IntPtr AllocEpollEvent(EpollLayout layout, uint events, long data)
+        {
+            IntPtr ev = Marshal.AllocHGlobal(layout.Size);
+            Marshal.Copy(new byte[layout.Size], 0, ev, layout.Size);
+            Marshal.WriteInt32(ev, 0, unchecked((int)events));
+            Marshal.WriteInt64(ev, layout.DataOffset, data);
+            return ev;
+        }
+
         private async Task EpollLoop(Channel<PacketBuffer>[] channels, CancellationToken ct)
         {
-            var events = new epoll_event[8];
-
-            while (Volatile.Read(ref _disposed) == 0 && !ct.IsCancellationRequested)
+            const int maxEvents = 8;
+            IntPtr events = Marshal.AllocHGlobal(_epollLayout.Size * maxEvents);
+            try
             {
-                int n = Libc.epoll_wait(_epfd, events, events.Length, -1);
-                if (n < 0)
+                while (Volatile.Read(ref _disposed) == 0 && !ct.IsCancellationRequested)
                 {
-                    int err = Marshal.GetLastWin32Error();
-                    if (err == Libc.EINTR) continue;
-                    logger?.LogWarning($"[READ] epoll_wait failed: errno={err}");
-                    break;
-                }
+                    int n = Libc.epoll_wait(_epfd, events, maxEvents, -1);
+                    if (n < 0)
+                    {
+                        int err = Marshal.GetLastWin32Error();
+                        if (err == Libc.EINTR) continue;
+                        logger?.LogWarning($"[READ] epoll_wait failed: errno={err}");
+                        break;
+                    }
 
-                bool wake = false, tunReadable = false;
-                for (int i = 0; i < n; i++)
-                {
-                    long s = (long)events[i].data;
-                    if (s == _eventFd) wake = true;
-                    else if (s == _fd) tunReadable = true;
-                }
+                    bool wake = false, tunReadable = false;
+                    for (int i = 0; i < n; i++)
+                    {
+                        IntPtr ev = new(_epollLayout.EventAddress(events, i));
+                        long s = Marshal.ReadInt64(ev, _epollLayout.DataOffset);
+                        if (s == _eventFd) wake = true;
+                        else if (s == _fd) tunReadable = true;
+                    }
 
-                if (wake) break;
-                if (tunReadable) await DrainTun(channels, ct);
+                    if (wake) break;
+                    if (tunReadable) await DrainTun(channels, ct);
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(events);
             }
         }
 
