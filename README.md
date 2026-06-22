@@ -1,6 +1,9 @@
 # TunRelay
 
-TunRelay is a simple TCP/TLS based TUN IP tunneling tool.
+TunRelay is a lightweight intranet tunneling solution. It uses a TUN tunnel to
+create an IP-level forwarding path between a public Linux server and an
+internal Windows/Linux host, securely exposing selected TCP/UDP services for
+remote access.
 
 It runs a Windows or Linux client and a Linux server with NFQUEUE/iptables.
 The server forwards selected TCP/UDP service ports to the client through an
@@ -33,7 +36,6 @@ licenses/ Third-party license texts
 ### Client
 
 - Windows or Linux
-- .NET 10 SDK or runtime
 - Administrator/root privileges
 - Windows: `wintun.dll` next to the client executable
 - Linux: `/dev/net/tun` and the `ip` command from `iproute2`
@@ -41,7 +43,6 @@ licenses/ Third-party license texts
 ### Server
 
 - Linux
-- .NET 10 SDK or runtime
 - Root privileges
 - `iptables`
 - `libnetfilter_queue`
@@ -52,7 +53,48 @@ Example Debian/Ubuntu dependencies:
 sudo apt install iptables libnetfilter-queue1
 ```
 
-## Build
+## Download
+
+For normal use, download a release binary from
+[Releases](https://github.com/hushfox37/TunRelay/releases).
+
+Choose the package that matches your machine:
+
+- Server on Linux x64: `TunRelayServer-linux-x64`
+- Client on Windows x64: `TunRelayClient-win-x64`
+- Client on Linux x64: `TunRelayClient-linux-x64`
+- Client on Linux ARM64: `TunRelayClient-linux-arm64`
+
+The release binaries are self-contained. You do not need to install the .NET
+runtime on the target machine.
+
+## Run
+
+Run the server as root:
+
+```bash
+sudo ./TunRelayServer
+```
+
+Run the Windows client as Administrator:
+
+```powershell
+.\TunRelayClient.exe
+```
+
+Run the Linux client as root:
+
+```bash
+sudo ./TunRelayClient
+```
+
+Both programs read `config.json` from their current working directory. If the
+file does not exist, it is created with default values; edit it and restart the
+program.
+
+## Build From Source
+
+Install the .NET 10 SDK before building from source.
 
 ```bash
 dotnet build Client/TunRelayClient.csproj
@@ -100,9 +142,6 @@ dotnet publish Server\TunRelayServer.csproj -c Release -r linux-x64 --self-conta
 ```
 
 ## Configuration
-
-Both programs read `config.json` from their current working directory. If the
-file does not exist, it is created with default values.
 
 ### Server `config.json`
 
@@ -204,29 +243,6 @@ the client during the control handshake. `UplinkConnections` and
 
 Packets are assigned to a data connection with a stable IPv4 5-tuple flow hash
 so packets from the same TCP/UDP flow stay on the same connection.
-
-## Run
-
-Start the server as root:
-
-```bash
-sudo dotnet run --project Server/TunRelayServer.csproj
-```
-
-Start the Windows client as Administrator:
-
-```powershell
-dotnet run --project Client\TunRelayClient.csproj
-```
-
-Start the Linux client as root:
-
-```bash
-sudo dotnet run --project Client/TunRelayClient.csproj
-```
-
-For published binaries, run each executable from the directory containing its
-`config.json`.
 
 ## Runtime Stats
 
