@@ -1,9 +1,8 @@
 ﻿using System.Collections.Concurrent;
 using System.Threading.Channels;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -28,7 +27,7 @@ namespace TunRelayClient
                     case "--Secret":
                         if (i + 1 < args.Length)
                         {
-                            ConfigManager.Update<TunRelayConfig>("config.json", config =>
+                            ConfigManager.Update("config.json", config =>
                             {
                                 config.Secret = args[++i];
                             });
@@ -40,7 +39,7 @@ namespace TunRelayClient
 
             // 加载配置文件
             const string configPath = "config.json";
-            var config = ConfigManager.LoadOrCreate<TunRelayConfig>(configPath);
+            var config = ConfigManager.LoadOrCreate(configPath);
 
             ServerIP = config.ServerIp;
             ServerPort = config.EffectiveServerPort;
@@ -119,17 +118,24 @@ namespace TunRelayClient
 
             // 接收服务器分配的虚拟IP地址、端口配置、并行连接数与 sessionId
             var Data = await tunnelNet.ReceiveControlAsync(cts.Token);
-            var json = JObject.Parse(Data);
-            TunnelIP = json["TunnelIP"]?.ToString() ?? TunnelIP;
-            var ports = (JArray)json["Ports"]!;
-            foreach (var port in ports)
+            using var json = JsonDocument.Parse(Data);
+            var root = json.RootElement;
+            TunnelIP = root.TryGetProperty("TunnelIP", out var tunnelIp) ? tunnelIp.GetString() ?? TunnelIP : TunnelIP;
+
+            if (!root.TryGetProperty("Ports", out var ports) || ports.ValueKind != JsonValueKind.Array)
             {
-                PortConfig.Add(port.ToObject<int>());
+                logger?.LogError("服务端未下发端口配置");
+                throw new InvalidOperationException("服务端未下发端口配置");
             }
 
-            int uplink = Math.Clamp(json["UplinkConnections"]?.ToObject<int>() ?? 1, 1, 16);
-            int downlink = Math.Clamp(json["DownlinkConnections"]?.ToObject<int>() ?? 1, 1, 16);
-            string sessionId = json["SessionId"]?.ToString() ?? "";
+            foreach (var port in ports.EnumerateArray())
+            {
+                PortConfig.Add(port.GetInt32());
+            }
+
+            int uplink = Math.Clamp(root.TryGetProperty("UplinkConnections", out var uplinkJson) ? uplinkJson.GetInt32() : 1, 1, 16);
+            int downlink = Math.Clamp(root.TryGetProperty("DownlinkConnections", out var downlinkJson) ? downlinkJson.GetInt32() : 1, 1, 16);
+            string sessionId = root.TryGetProperty("SessionId", out var sessionIdJson) ? sessionIdJson.GetString() ?? "" : "";
             if (string.IsNullOrEmpty(sessionId))
             {
                 logger?.LogError("服务端未下发 sessionId");
@@ -199,7 +205,9 @@ namespace TunRelayClient
 
             string sign = Convert.ToHexString(hmac.ComputeHash(msg));
 
-            var json = JsonConvert.SerializeObject(new { ClientID = data, Timestamp = timestamp, Sign = sign });
+            var json = JsonSerializer.Serialize(
+                new AuthenticationRequest { ClientID = data, Timestamp = timestamp, Sign = sign },
+                TunRelayJsonContext.Default.AuthenticationRequest);
             logger?.LogInformation($"[AUTH] 发送认证 ClientID={data}, Timestamp={timestamp}");
             await tunnelNet.SendControlAsync(json, ct);
             var IfSuccess = await tunnelNet.ReceiveControlAsync(ct);

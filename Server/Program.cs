@@ -3,7 +3,7 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Channels;
-using Newtonsoft.Json;
+using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -28,7 +28,7 @@ namespace TunRelayServer
         static async Task Main(string[] args)
         {
             const string configPath = "config.json";
-            var config = ConfigManager.LoadOrCreate<TunRelayConfig>(configPath);
+            var config = ConfigManager.LoadOrCreate(configPath);
             LoadConfig(config);
 
             //配置日志
@@ -119,16 +119,18 @@ namespace TunRelayServer
 
                     control = await ServerNet.AcceptControlAsync(listener, cert, config, cts.Token);
 
-                    var json = JsonConvert.SerializeObject(new
-                    {
-                        TunnelIP,
-                        Ports = ports,
-                        TcpPorts = tcpPorts,
-                        UdpPorts = udpPorts,
-                        UplinkConnections = uplinkConnections,
-                        DownlinkConnections = downlinkConnections,
-                        SessionId = control.SessionId
-                    });
+                    var json = JsonSerializer.Serialize(
+                        new ServerConfigPayload
+                        {
+                            TunnelIP = TunnelIP,
+                            Ports = ports,
+                            TcpPorts = tcpPorts,
+                            UdpPorts = udpPorts,
+                            UplinkConnections = uplinkConnections,
+                            DownlinkConnections = downlinkConnections,
+                            SessionId = control.SessionId
+                        },
+                        TunRelayJsonContext.Default.ServerConfigPayload);
                     await ServerNet.SendAsync(control.Ssl, Encoding.UTF8.GetBytes(json), cts.Token);
                     logger?.LogInformation($"已下发配置: TunnelIP={TunnelIP}, Uplink={uplinkConnections}, Downlink={downlinkConnections}");
 

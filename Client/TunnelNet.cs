@@ -4,7 +4,7 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using Newtonsoft.Json;
+using System.Text.Json;
 
 namespace TunRelayClient
 {
@@ -60,7 +60,9 @@ namespace TunRelayClient
             var ssl = new SslStream(tcp.GetStream(), false, ValidateServerCertificate, null);
             await ssl.AuthenticateAsClientAsync(ServerIP);
 
-            var handshake = JsonConvert.SerializeObject(new { SessionId = sessionId, Role = role, Index = index });
+            var handshake = JsonSerializer.Serialize(
+                new DataChannelHandshake { SessionId = sessionId, Role = role, Index = index },
+                TunRelayJsonContext.Default.DataChannelHandshake);
             await SendAsync(Encoding.UTF8.GetBytes(handshake), ssl, ct);
             return (tcp, ssl);
         }
