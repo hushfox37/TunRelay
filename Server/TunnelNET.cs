@@ -7,7 +7,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using Newtonsoft.Json;
+using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -71,12 +71,6 @@ namespace TunRelayServer
     static class ServerNet
     {
         static ILogger _logger;
-        sealed class AuthenticationRequest
-        {
-            public string ClientID { get; set; } = "";
-            public long Timestamp { get; set; }
-            public string Sign { get; set; } = "";
-        }
 
         public static void Init(ILogger logger)
         {
@@ -157,8 +151,9 @@ namespace TunRelayServer
                     {
                         await ssl.AuthenticateAsServerAsync(cert, false, false);
                         using var data = await ReceiveAsync(ssl, timeoutCts.Token);
-                        var hs = JsonConvert.DeserializeObject<DataChannelHandshake>(
-                            Encoding.UTF8.GetString(data.Buffer, 0, data.Length));
+                        var hs = JsonSerializer.Deserialize(
+                            Encoding.UTF8.GetString(data.Buffer, 0, data.Length),
+                            TunRelayJsonContext.Default.DataChannelHandshake);
 
                         if (hs == null
                             || !FixedTimeHexEquals(hs.SessionId, control.SessionId)
@@ -205,7 +200,7 @@ namespace TunRelayServer
         {
             using var data = await ReceiveAsync(controlSsl, ct);
             string json = Encoding.UTF8.GetString(data.Buffer, 0, data.Length);
-            var request = JsonConvert.DeserializeObject<AuthenticationRequest>(json);
+            var request = JsonSerializer.Deserialize(json, TunRelayJsonContext.Default.AuthenticationRequest);
             if (request == null)
             {
                 _logger?.LogWarning("[AUTH] 失败: 请求格式无效");

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 
 public class TunRelayConfig
 {
@@ -26,34 +27,60 @@ public class TunRelayConfig
 
 public static class ConfigManager
 {
-    private static readonly JsonSerializerOptions Options = new()
-    {
-        WriteIndented = true
-    };
+    public static TunRelayConfig LoadOrCreate(string path)
+        => LoadOrCreate(path, TunRelayJsonContext.Default.TunRelayConfig);
 
-    public static T LoadOrCreate<T>(string path) where T : new()
+    public static void Save(string path, TunRelayConfig config)
+        => Save(path, config, TunRelayJsonContext.Default.TunRelayConfig);
+
+    public static TunRelayConfig Update(string path, Action<TunRelayConfig> update)
+        => Update(path, update, TunRelayJsonContext.Default.TunRelayConfig);
+
+    public static T LoadOrCreate<T>(string path, JsonTypeInfo<T> jsonTypeInfo) where T : new()
     {
         if (File.Exists(path))
         {
             string json = File.ReadAllText(path);
-            return JsonSerializer.Deserialize<T>(json, Options) ?? new T();
+            return JsonSerializer.Deserialize(json, jsonTypeInfo) ?? new T();
         }
 
         T config = new();
-        File.WriteAllText(path, JsonSerializer.Serialize(config, Options));
+        File.WriteAllText(path, JsonSerializer.Serialize(config, jsonTypeInfo));
         return config;
     }
 
-    public static void Save<T>(string path, T config)
+    public static void Save<T>(string path, T config, JsonTypeInfo<T> jsonTypeInfo)
     {
-        File.WriteAllText(path, JsonSerializer.Serialize(config, Options));
+        File.WriteAllText(path, JsonSerializer.Serialize(config, jsonTypeInfo));
     }
 
-    public static T Update<T>(string path, Action<T> update) where T : new()
+    public static T Update<T>(string path, Action<T> update, JsonTypeInfo<T> jsonTypeInfo) where T : new()
     {
-        T config = LoadOrCreate<T>(path);
+        T config = LoadOrCreate(path, jsonTypeInfo);
         update(config);
-        Save(path, config);
+        Save(path, config, jsonTypeInfo);
         return config;
     }
+}
+
+public sealed class DataChannelHandshake
+{
+    public string SessionId { get; set; } = "";
+    public string Role { get; set; } = "";
+    public int Index { get; set; }
+}
+
+public sealed class AuthenticationRequest
+{
+    public string ClientID { get; set; } = "";
+    public long Timestamp { get; set; }
+    public string Sign { get; set; } = "";
+}
+
+[JsonSerializable(typeof(TunRelayConfig))]
+[JsonSerializable(typeof(DataChannelHandshake))]
+[JsonSerializable(typeof(AuthenticationRequest))]
+[JsonSourceGenerationOptions(WriteIndented = true)]
+public partial class TunRelayJsonContext : JsonSerializerContext
+{
 }
