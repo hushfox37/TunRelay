@@ -29,6 +29,7 @@ namespace TunRelayClient
             int uplink = control.Assignment.Uplink;
             int downlink = control.Assignment.Downlink;
             ApplyPortConfig(control.Assignment.Ports);
+            RuntimeStatus.SetAssigned(uplink, downlink, control.Assignment.SessionId);
 
             _logger.LogInformation($"服务端下发: TunnelIP={Program.TunnelIP}, Ports={string.Join(",", control.Assignment.Ports)}, Uplink={uplink}, Downlink={downlink}");
 
@@ -47,6 +48,7 @@ namespace TunRelayClient
                 try
                 {
                     ApplyPortConfig(control.Assignment.Ports);
+                    RuntimeStatus.SetSessionRunning(control.Assignment.SessionId);
                     await RunSessionAsync(control.Net, control.Assignment.SessionId, uplinkChannels, uplink, downlink, batchOptions, ct);
                     _reconnectPolicy.Reset();
                 }
@@ -69,6 +71,7 @@ namespace TunRelayClient
                 await Task.Delay(_reconnectPolicy.Delay, ct);
 
                 control = await _controlHandshake.ConnectWithRetryAsync(_reconnectPolicy, ct, Program.TunnelIP, uplink, downlink);
+                RuntimeStatus.SetAssigned(uplink, downlink, control.Assignment.SessionId);
                 _logger.LogInformation($"服务端下发: TunnelIP={control.Assignment.TunnelIp}, Ports={string.Join(",", control.Assignment.Ports)}, Uplink={control.Assignment.Uplink}, Downlink={control.Assignment.Downlink}");
             }
         }
@@ -100,7 +103,7 @@ namespace TunRelayClient
         {
             using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             var sessionToken = sessionCts.Token;
-            var loops = new List<Task>(uplink + downlink);
+            var loops = new List<(string Name, Task Task)>(uplink + downlink);
 
             try
             {
@@ -114,26 +117,44 @@ namespace TunRelayClient
                 for (int i = 0; i < uplink; i++)
                 {
                     int idx = i;
-                    loops.Add(Task.Run(() => DataChannel.SendLoopAsync(uplinkChannels[idx].Reader, txStreams[idx], batchOptions, sessionToken)));
+                    loops.Add(($"tx#{idx}", Task.Run(() => DataChannel.SendLoopAsync(uplinkChannels[idx].Reader, txStreams[idx], batchOptions, sessionToken))));
                 }
 
                 var rxStreams = net.RxStreams;
                 for (int i = 0; i < downlink; i++)
                 {
                     int idx = i;
-                    loops.Add(Task.Run(() => DataChannel.ReceiveLoopAsync(
+                    loops.Add(($"rx#{idx}", Task.Run(() => DataChannel.ReceiveLoopAsync(
                         rxStreams[idx],
                         (packet, c) => new ValueTask(Program.tunnelTUN.WriteAsync(packet, c)),
-                        sessionToken)));
+                        sessionToken))));
                 }
 
-                await Task.WhenAny(loops);
+                var completed = await Task.WhenAny(loops.Select(loop => loop.Task));
+                LogCompletedLoop(loops, completed);
             }
             finally
             {
                 sessionCts.Cancel();
-                try { await Task.WhenAll(loops); } catch { }
+                try { await Task.WhenAll(loops.Select(loop => loop.Task)); } catch { }
                 net.Close();
+            }
+        }
+
+        private void LogCompletedLoop(List<(string Name, Task Task)> loops, Task completed)
+        {
+            var loopName = loops.FirstOrDefault(loop => ReferenceEquals(loop.Task, completed)).Name ?? "unknown";
+            if (completed.IsFaulted)
+            {
+                _logger.LogError(completed.Exception?.GetBaseException(), $"[SESSION] 首个退出: {loopName} faulted");
+            }
+            else if (completed.IsCanceled)
+            {
+                _logger.LogWarning($"[SESSION] 首个退出: {loopName} canceled");
+            }
+            else
+            {
+                _logger.LogWarning($"[SESSION] 首个退出: {loopName} completed");
             }
         }
 
