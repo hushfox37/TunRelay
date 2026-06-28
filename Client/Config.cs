@@ -17,6 +17,8 @@ public class TunRelayConfig
     public int BatchDelayMs { get; set; } = 1;
     public int MaxBatchBytes { get; set; } = 65536;
     public int MaxBatchPackets { get; set; } = 32;
+    public int ReconnectDelayMs { get; set; } = 5000;
+    public int MaxReconnectAttempts { get; set; } = 0;
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? ServerPorts { get; set; }
