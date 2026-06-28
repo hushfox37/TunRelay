@@ -62,6 +62,7 @@ namespace TunRelayClient
                 {
                     net?.Close();
                     int attempts = reconnectPolicy.RecordFailure();
+                    RuntimeStatus.SetReconnecting(attempts);
                     if (reconnectPolicy.HasReachedLimit)
                     {
                         _logger.LogError(ex, $"连接服务器失败，已达到重连上限 {reconnectPolicy.MaxAttempts}");

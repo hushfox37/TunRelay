@@ -13,6 +13,8 @@ namespace TunRelayClient
         public static TunnelNet tunnelNet = null!;
         public static ConcurrentBag<int> PortConfig = new ConcurrentBag<int>();
         public static ILogger logger = null!;
+        public static TunRelayConfig CurrentConfig = null!;
+        public static LogLevel CurrentLogLevel;
 
         static async Task Main(string[] args)
         {
@@ -21,6 +23,7 @@ namespace TunRelayClient
 
             // 先加载配置并同步到旧静态字段，供现有 TUN/DataChannel 代码读取。
             var config = ConfigManager.LoadOrCreate(configPath);
+            CurrentConfig = config;
             ServerIP = config.ServerIp;
             ServerPort = config.EffectiveServerPort;
 
@@ -95,10 +98,12 @@ namespace TunRelayClient
                 config.LogLevel,
                 true,
                 out var logLevel);
+            CurrentLogLevel = logLevel;
 
             services.AddLogging(builder =>
             {
-                builder.SetMinimumLevel(logLevel);
+                builder.SetMinimumLevel(LogLevel.Trace);
+                builder.AddFilter((_, level) => level >= CurrentLogLevel);
                 builder.AddSimpleConsole(options =>
                 {
                     options.SingleLine = true;

@@ -1,5 +1,6 @@
 using System.Text;
 using System.Threading;
+using Microsoft.Extensions.Logging;
 
 namespace TunRelayClient
 {
@@ -104,6 +105,9 @@ namespace TunRelayClient
     {
         private const string HelpText =
             "命令:\n" +
+            "  status       打印当前运行状态\n" +
+            "  config       打印当前生效配置(隐藏 Secret)\n" +
+            "  loglevel <level>  动态调整日志级别\n" +
             "  stats        打印当前统计快照\n" +
             "  stats reset  清零统计\n" +
             "  help         显示帮助";
@@ -133,9 +137,22 @@ namespace TunRelayClient
                 if (line == null)
                     break;
 
-                switch (line.Trim())
+                var command = line.Trim();
+                if (command.StartsWith("loglevel ", StringComparison.OrdinalIgnoreCase))
+                {
+                    SetLogLevel(command["loglevel ".Length..].Trim());
+                    continue;
+                }
+
+                switch (command)
                 {
                     case "":
+                        break;
+                    case "status":
+                        Console.WriteLine(RuntimeStatus.Snapshot());
+                        break;
+                    case "config":
+                        Console.WriteLine(ConfigSnapshot());
                         break;
                     case "stats":
                         Console.WriteLine(TunnelStats.Snapshot());
@@ -149,10 +166,44 @@ namespace TunRelayClient
                         Console.WriteLine(HelpText);
                         break;
                     default:
-                        Console.WriteLine($"[shell] 未知命令: {line.Trim()} (输入 help)");
+                        Console.WriteLine($"[shell] 未知命令: {command} (输入 help)");
                         break;
                 }
             }
+        }
+
+        private static void SetLogLevel(string value)
+        {
+            if (!Enum.TryParse<LogLevel>(value, true, out var level))
+            {
+                Console.WriteLine($"[shell] 无效日志级别: {value}");
+                return;
+            }
+
+            Program.CurrentLogLevel = level;
+            Console.WriteLine($"[shell] 日志级别已切换为 {level}");
+        }
+
+        private static string ConfigSnapshot()
+        {
+            var config = Program.CurrentConfig;
+            if (config == null)
+                return "[shell] 配置尚未加载";
+
+            var sb = new StringBuilder();
+            sb.AppendLine("===== ClientConfig =====");
+            sb.AppendLine($"ServerIp              : {config.ServerIp}");
+            sb.AppendLine($"ServerPort            : {config.EffectiveServerPort}");
+            sb.AppendLine($"ClientID              : {config.ClientID}");
+            sb.AppendLine($"Secret                : {(string.IsNullOrEmpty(config.Secret) ? "" : "****")}");
+            sb.AppendLine($"LogLevel              : {Program.CurrentLogLevel}");
+            sb.AppendLine($"BatchDelayMs          : {config.BatchDelayMs}");
+            sb.AppendLine($"MaxBatchBytes         : {config.MaxBatchBytes}");
+            sb.AppendLine($"MaxBatchPackets       : {config.MaxBatchPackets}");
+            sb.AppendLine($"ReconnectDelayMs      : {config.ReconnectDelayMs}");
+            sb.AppendLine($"MaxReconnectAttempts  : {config.MaxReconnectAttempts}");
+            sb.Append("========================");
+            return sb.ToString();
         }
     }
 }
