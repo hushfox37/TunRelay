@@ -10,13 +10,55 @@ namespace TunRelayClient
 {
     class Program
     {
-        public static string TunnelIP;
-        public static string ServerIP;
+        public static string TunnelIP = "";
+        public static string ServerIP = "";
         public static int ServerPort;
-        public static TUN tunnelTUN;
-        public static TunnelNet tunnelNet;
+        public static TUN tunnelTUN = null!;
+        public static TunnelNet tunnelNet = null!;
         public static ConcurrentBag<int> PortConfig = new ConcurrentBag<int>();
-        public static ILogger logger;
+        public static ILogger logger = null!;
+
+        private sealed class ServerAssignment
+        {
+            public string TunnelIp { get; init; } = "";
+            public int[] Ports { get; init; } = Array.Empty<int>();
+            public int Uplink { get; init; }
+            public int Downlink { get; init; }
+            public string SessionId { get; init; } = "";
+        }
+
+        private sealed class ControlSession
+        {
+            public TunnelNet Net { get; init; } = null!;
+            public ServerAssignment Assignment { get; init; } = null!;
+        }
+
+        private sealed class ReconnectPolicy
+        {
+            public ReconnectPolicy(TimeSpan delay, int maxAttempts)
+            {
+                Delay = delay;
+                MaxAttempts = maxAttempts;
+            }
+
+            public TimeSpan Delay { get; }
+            public int MaxAttempts { get; }
+            public int Attempts { get; private set; }
+            public string LimitText => MaxAttempts == 0 ? "无限" : MaxAttempts.ToString();
+            public bool HasReachedLimit => MaxAttempts > 0 && Attempts >= MaxAttempts;
+
+            public int RecordFailure()
+            {
+                Attempts++;
+                return Attempts;
+            }
+
+            public void Reset()
+            {
+                Attempts = 0;
+            }
+        }
+
         static async Task Main(string[] args)
         {
             // 命令行参数
@@ -100,39 +142,179 @@ namespace TunRelayClient
             }
 
             logger?.LogInformation($"配置: Server={ServerIP}:{ServerPort}, ClientID={config.ClientID}");
+            var reconnectPolicy = new ReconnectPolicy(
+                NormalizeReconnectDelay(config.ReconnectDelayMs),
+                Math.Max(0, config.MaxReconnectAttempts));
+            logger?.LogInformation($"重连参数: DelayMs={(int)reconnectPolicy.Delay.TotalMilliseconds}, MaxAttempts={reconnectPolicy.LimitText}");
 
             using var cts = new CancellationTokenSource();
-            tunnelNet = new TunnelNet(ServerIP, ServerPort);
-
-            logger?.LogInformation("正在连接服务器...");
-            await tunnelNet.ConnectControlAsync(cts.Token);
-            logger?.LogInformation("服务器控制连接已建立");
-
-            // 服务器身份验证
-            if (!await Authentication(tunnelNet, config.Secret, config.ClientID, cts.Token))
+            Console.CancelKeyPress += (_, e) =>
             {
-                logger?.LogError("认证失败");
-                throw new InvalidOperationException("认证失败");
+                e.Cancel = true;
+                cts.Cancel();
+            };
+
+            try
+            {
+                var control = await ConnectControlWithRetryAsync(config, reconnectPolicy, cts.Token);
+                TunnelIP = control.Assignment.TunnelIp;
+                int uplink = control.Assignment.Uplink;
+                int downlink = control.Assignment.Downlink;
+                ApplyPortConfig(control.Assignment.Ports);
+
+                logger?.LogInformation($"服务端下发: TunnelIP={TunnelIP}, Ports={string.Join(",", control.Assignment.Ports)}, Uplink={uplink}, Downlink={downlink}");
+
+                // 每条上行连接一个入口队列(TUN 读 -> 按流哈希分流到其中之一)
+                var uplinkChannels = new Channel<PacketBuffer>[uplink];
+                for (int i = 0; i < uplink; i++)
+                {
+                    uplinkChannels[i] = Channel.CreateBounded<PacketBuffer>(new BoundedChannelOptions(4096)
+                    {
+                        FullMode = BoundedChannelFullMode.DropOldest,
+                        SingleReader = true,
+                        SingleWriter = true
+                    });
+                }
+
+                // 启动 TUN。TUN 生命周期跟随进程，不跟随单次数据会话。
+                ITunDriver driver = TunDriverFactory.Create();
+                tunnelTUN = new TUN(driver, uplinkChannels);
+                await tunnelTUN.StartAsync(TunnelIP, cts.Token);
+
+                var batchOptions = new BatchOptions(config.BatchDelayMs, config.MaxBatchBytes, config.MaxBatchPackets);
+                logger?.LogInformation($"数据通道批处理参数: DelayMs={batchOptions.DelayMs}, MaxBytes={batchOptions.MaxBytes}, MaxPackets={batchOptions.MaxPackets}");
+
+                while (!cts.IsCancellationRequested)
+                {
+                    try
+                    {
+                        ApplyPortConfig(control.Assignment.Ports);
+                        await RunSessionAsync(control.Net, control.Assignment.SessionId, uplinkChannels, uplink, downlink, batchOptions, cts.Token);
+                        reconnectPolicy.Reset();
+                    }
+                    catch (OperationCanceledException) when (cts.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        logger?.LogError(ex, "数据会话异常断开");
+                        control.Net.Close();
+                    }
+
+                    if (cts.IsCancellationRequested)
+                    {
+                        break;
+                    }
+
+                    logger?.LogWarning($"数据连接已断开，{(int)reconnectPolicy.Delay.TotalMilliseconds} 毫秒后重连...");
+                    await Task.Delay(reconnectPolicy.Delay, cts.Token);
+
+                    control = await ConnectControlWithRetryAsync(config, reconnectPolicy, cts.Token, TunnelIP, uplink, downlink);
+                    logger?.LogInformation($"服务端下发: TunnelIP={control.Assignment.TunnelIp}, Ports={string.Join(",", control.Assignment.Ports)}, Uplink={control.Assignment.Uplink}, Downlink={control.Assignment.Downlink}");
+                }
             }
-            else logger?.LogInformation("认证成功");
+            catch (OperationCanceledException) when (cts.IsCancellationRequested)
+            {
+            }
+            finally
+            {
+                cts.Cancel();
+                shellCts.Cancel();
+                tunnelNet?.Close();
+            }
+        }
 
-            // 接收服务器分配的虚拟IP地址、端口配置、并行连接数与 sessionId
-            var Data = await tunnelNet.ReceiveControlAsync(cts.Token);
-            using var json = JsonDocument.Parse(Data);
+        private static async Task<ControlSession> ConnectControlWithRetryAsync(
+            TunRelayConfig config,
+            ReconnectPolicy reconnectPolicy,
+            CancellationToken ct,
+            string? expectedTunnelIp = null,
+            int? expectedUplink = null,
+            int? expectedDownlink = null)
+        {
+            while (true)
+            {
+                TunnelNet? net = null;
+                try
+                {
+                    net = new TunnelNet(ServerIP, ServerPort);
+                    tunnelNet = net;
+
+                    logger?.LogInformation("正在连接服务器...");
+                    await net.ConnectControlAsync(ct);
+                    logger?.LogInformation("服务器控制连接已建立");
+
+                    if (!await Authentication(net, config.Secret, config.ClientID, ct))
+                    {
+                        throw new InvalidOperationException("认证失败");
+                    }
+
+                    logger?.LogInformation("认证成功");
+                    var assignment = await ReceiveServerAssignmentAsync(net, ct);
+
+                    if (expectedTunnelIp != null &&
+                        (!string.Equals(assignment.TunnelIp, expectedTunnelIp, StringComparison.Ordinal) ||
+                         assignment.Uplink != expectedUplink ||
+                         assignment.Downlink != expectedDownlink))
+                    {
+                        throw new InvalidOperationException(
+                            $"重连下发参数变化: TunnelIP={assignment.TunnelIp}, Uplink={assignment.Uplink}, Downlink={assignment.Downlink}");
+                    }
+
+                    return new ControlSession { Net = net, Assignment = assignment };
+                }
+                catch (OperationCanceledException)
+                {
+                    net?.Close();
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    net?.Close();
+                    int attempts = reconnectPolicy.RecordFailure();
+                    if (reconnectPolicy.HasReachedLimit)
+                    {
+                        logger?.LogError(ex, $"连接服务器失败，已达到重连上限 {reconnectPolicy.MaxAttempts}");
+                        throw;
+                    }
+
+                    logger?.LogError(ex, $"连接服务器失败，第 {attempts} 次/上限 {reconnectPolicy.LimitText}，{(int)reconnectPolicy.Delay.TotalMilliseconds} 毫秒后重试");
+                    await Task.Delay(reconnectPolicy.Delay, ct);
+                }
+            }
+        }
+
+        private static TimeSpan NormalizeReconnectDelay(int reconnectDelayMs)
+        {
+            int delayMs = reconnectDelayMs <= 0 ? 5000 : reconnectDelayMs;
+            delayMs = Math.Clamp(delayMs, 100, 600000);
+            return TimeSpan.FromMilliseconds(delayMs);
+        }
+
+        private static async Task<ServerAssignment> ReceiveServerAssignmentAsync(TunnelNet net, CancellationToken ct)
+        {
+            var data = await net.ReceiveControlAsync(ct);
+            using var json = JsonDocument.Parse(data);
             var root = json.RootElement;
-            TunnelIP = root.TryGetProperty("TunnelIP", out var tunnelIp) ? tunnelIp.GetString() ?? TunnelIP : TunnelIP;
 
-            if (!root.TryGetProperty("Ports", out var ports) || ports.ValueKind != JsonValueKind.Array)
+            string tunnelIp = root.TryGetProperty("TunnelIP", out var tunnelIpJson)
+                ? tunnelIpJson.GetString() ?? ""
+                : "";
+
+            if (string.IsNullOrWhiteSpace(tunnelIp))
+            {
+                logger?.LogError("服务端未下发 TunnelIP");
+                throw new InvalidOperationException("服务端未下发 TunnelIP");
+            }
+
+            if (!root.TryGetProperty("Ports", out var portsJson) || portsJson.ValueKind != JsonValueKind.Array)
             {
                 logger?.LogError("服务端未下发端口配置");
                 throw new InvalidOperationException("服务端未下发端口配置");
             }
 
-            foreach (var port in ports.EnumerateArray())
-            {
-                PortConfig.Add(port.GetInt32());
-            }
-
+            var ports = portsJson.EnumerateArray().Select(port => port.GetInt32()).ToArray();
             int uplink = Math.Clamp(root.TryGetProperty("UplinkConnections", out var uplinkJson) ? uplinkJson.GetInt32() : 1, 1, 16);
             int downlink = Math.Clamp(root.TryGetProperty("DownlinkConnections", out var downlinkJson) ? downlinkJson.GetInt32() : 1, 1, 16);
             string sessionId = root.TryGetProperty("SessionId", out var sessionIdJson) ? sessionIdJson.GetString() ?? "" : "";
@@ -142,56 +324,81 @@ namespace TunRelayClient
                 throw new InvalidOperationException("服务端未下发 sessionId");
             }
 
-            logger?.LogInformation($"服务端下发: TunnelIP={TunnelIP}, Ports={string.Join(",", PortConfig)}, Uplink={uplink}, Downlink={downlink}");
+            return new ServerAssignment
+            {
+                TunnelIp = tunnelIp,
+                Ports = ports,
+                Uplink = uplink,
+                Downlink = downlink,
+                SessionId = sessionId
+            };
+        }
 
-            // 建立 N 条上行 + N 条下行数据连接
-            await tunnelNet.ConnectDataChannelsAsync(uplink, downlink, sessionId, cts.Token);
-            logger?.LogInformation($"数据连接已建立: 上行 {uplink} 条, 下行 {downlink} 条");
-
-            // 每条上行连接一个入口队列(TUN 读 -> 按流哈希分流到其中之一)
-            var uplinkChannels = new Channel<PacketBuffer>[uplink];
-            for (int i = 0; i < uplink; i++)
-                uplinkChannels[i] = Channel.CreateBounded<PacketBuffer>(new BoundedChannelOptions(4096)
-                {
-                    FullMode = BoundedChannelFullMode.Wait,
-                    SingleReader = true,
-                    SingleWriter = true
-                });
-
-            // 启动 TUN
-            ITunDriver driver = TunDriverFactory.Create();
-            tunnelTUN = new TUN(driver, uplinkChannels);
-            await tunnelTUN.StartAsync(TunnelIP, cts.Token);
-
-            var batchOptions = new BatchOptions(config.BatchDelayMs, config.MaxBatchBytes, config.MaxBatchPackets);
-            logger?.LogInformation($"数据通道批处理参数: DelayMs={batchOptions.DelayMs}, MaxBytes={batchOptions.MaxBytes}, MaxPackets={batchOptions.MaxPackets}");
-
+        private static async Task RunSessionAsync(
+            TunnelNet net,
+            string sessionId,
+            Channel<PacketBuffer>[] uplinkChannels,
+            int uplink,
+            int downlink,
+            BatchOptions batchOptions,
+            CancellationToken ct)
+        {
+            using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var sessionToken = sessionCts.Token;
             var loops = new List<Task>(uplink + downlink);
 
-            // 上行: 每条连接 uplinkChannels[i] 聚合成 batch -> TLS Tx[i]
-            var txStreams = tunnelNet.TxStreams;
-            for (int i = 0; i < uplink; i++)
+            try
             {
-                int idx = i;
-                loops.Add(Task.Run(() => DataChannel.SendLoopAsync(uplinkChannels[idx].Reader, txStreams[idx], batchOptions, cts.Token)));
-            }
+                DrainUplinkChannels(uplinkChannels);
 
-            // 下行: 每条连接 TLS Rx[i] 解析 batch -> 并发逐包写入 TUN
-            var rxStreams = tunnelNet.RxStreams;
-            for (int i = 0; i < downlink; i++)
+                // 建立 N 条上行 + N 条下行数据连接
+                await net.ConnectDataChannelsAsync(uplink, downlink, sessionId, sessionToken);
+                logger?.LogInformation($"数据连接已建立: 上行 {uplink} 条, 下行 {downlink} 条");
+
+                // 上行: 每条连接 uplinkChannels[i] 聚合成 batch -> TLS Tx[i]
+                var txStreams = net.TxStreams;
+                for (int i = 0; i < uplink; i++)
+                {
+                    int idx = i;
+                    loops.Add(Task.Run(() => DataChannel.SendLoopAsync(uplinkChannels[idx].Reader, txStreams[idx], batchOptions, sessionToken)));
+                }
+
+                // 下行: 每条连接 TLS Rx[i] 解析 batch -> 并发逐包写入 TUN
+                var rxStreams = net.RxStreams;
+                for (int i = 0; i < downlink; i++)
+                {
+                    int idx = i;
+                    loops.Add(Task.Run(() => DataChannel.ReceiveLoopAsync(
+                        rxStreams[idx],
+                        (packet, c) => new ValueTask(tunnelTUN.WriteAsync(packet, c)),
+                        sessionToken)));
+                }
+
+                // 原子会话: 任一连接断开则整体收尾
+                await Task.WhenAny(loops);
+            }
+            finally
             {
-                int idx = i;
-                loops.Add(Task.Run(() => DataChannel.ReceiveLoopAsync(
-                    rxStreams[idx],
-                    (packet, c) => new ValueTask(tunnelTUN.WriteAsync(packet, c)),
-                    cts.Token)));
+                sessionCts.Cancel();
+                try { await Task.WhenAll(loops); } catch { }
+                net.Close();
             }
+        }
 
-            // 原子会话: 任一连接断开则整体收尾
-            await Task.WhenAny(loops);
-            cts.Cancel();
-            try { await Task.WhenAll(loops); } catch { }
-            logger?.LogWarning("数据连接已断开");
+        private static void ApplyPortConfig(IEnumerable<int> ports)
+        {
+            PortConfig = new ConcurrentBag<int>(ports);
+        }
+
+        private static void DrainUplinkChannels(Channel<PacketBuffer>[] uplinkChannels)
+        {
+            foreach (var channel in uplinkChannels)
+            {
+                while (channel.Reader.TryRead(out var packet))
+                {
+                    packet.Dispose();
+                }
+            }
         }
 
         static async Task<bool> Authentication(TunnelNet tunnelNet, string secret, string data, CancellationToken ct = default)
