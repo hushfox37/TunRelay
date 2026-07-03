@@ -6,6 +6,8 @@ namespace TunRelayClient
 {
     class Program
     {
+        private const string ConfigPath = "config.json";
+
         public static string TunnelIP = "";
         public static string ServerIP = "";
         public static int ServerPort;
@@ -18,11 +20,10 @@ namespace TunRelayClient
 
         static async Task Main(string[] args)
         {
-            const string configPath = "config.json";
-            HandleCommandLine(args, configPath);
+            HandleCommandLine(args, ConfigPath);
 
             // 先加载配置并同步到旧静态字段，供现有 TUN/DataChannel 代码读取。
-            var config = ConfigManager.LoadOrCreate(configPath);
+            var config = ConfigManager.LoadOrCreate(ConfigPath);
             CurrentConfig = config;
             ServerIP = config.ServerIp;
             ServerPort = config.EffectiveServerPort;
@@ -38,11 +39,10 @@ namespace TunRelayClient
             _ = Task.Run(() => ConsoleShell.RunAsync(shellCts.Token));
 
             ValidateConfig(config);
-            EnsureClientId(configPath, config);
+            EnsureClientId(ConfigPath, config);
             if (string.IsNullOrWhiteSpace(config.Secret))
             {
-                logger.LogError("密钥未填写");
-                return;
+                logger.LogWarning("Secret 未填写，将尝试向服务端申请一次性自动配置");
             }
 
             // Ctrl+C 只触发取消，让各层按自己的 finally 做收尾。
@@ -56,7 +56,7 @@ namespace TunRelayClient
             try
             {
                 // 运行期负责 TUN 生命周期、数据会话和重连循环。
-                var runtime = new ClientRuntime(config, logger);
+                var runtime = new ClientRuntime(config, ConfigPath, logger);
                 await runtime.RunAsync(cts.Token);
             }
             catch (OperationCanceledException) when (cts.IsCancellationRequested)

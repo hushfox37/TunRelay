@@ -12,6 +12,8 @@ namespace TunRelayServer
 {
     class Program
     {
+        private const string ConfigPath = "config.json";
+
         // 下行单包入口队列(每条下行连接一个): NFQueue 按流哈希分流写入。满则丢包计数。
         private static Channel<PacketBuffer>[] _downlinkChannels = Array.Empty<Channel<PacketBuffer>>();
 
@@ -22,13 +24,15 @@ namespace TunRelayServer
         private static int[] ports;
         private static int uplinkConnections;
         private static int downlinkConnections;
+        private static TunRelayConfig CurrentConfig = null!;
         public static ILogger logger;
         private static BatchOptions batchOptions;
 
         static async Task Main(string[] args)
         {
-            const string configPath = "config.json";
-            var config = ConfigManager.LoadOrCreate(configPath);
+            var config = ConfigManager.LoadOrCreate(ConfigPath);
+            ApplyCommandLine(args, ConfigPath, config);
+            CurrentConfig = config;
             LoadConfig(config);
 
             //配置日志
@@ -57,7 +61,7 @@ namespace TunRelayServer
                 .CreateLogger("");
 
             IptablesManager.Init(logger);
-            ServerNet.Init(logger);
+            ServerNet.Init(logger, ConfigPath);
 
             batchOptions = new BatchOptions(config.BatchDelayMs, config.MaxBatchBytes, config.MaxBatchPackets);
             logger?.LogInformation($"数据通道批处理参数: DelayMs={batchOptions.DelayMs}, MaxBytes={batchOptions.MaxBytes}, MaxPackets={batchOptions.MaxPackets}");
@@ -65,10 +69,14 @@ namespace TunRelayServer
             if (string.IsNullOrWhiteSpace(config.Secret))
             {
                 config.Secret = ServerNet.GenerateSecret();
-                ConfigManager.Save(configPath, config);
+                ConfigManager.Save(ConfigPath, config);
                 logger?.LogInformation("已生成 Secret");
-                return;
+                if (!config.AutoCredentials)
+                    return;
             }
+
+            if (config.AutoCredentials)
+                logger?.LogWarning("AutoCredentials 已开启: 将允许下一个未配置客户端自动写入 ClientID/Secret，成功后会自动关闭");
 
             logger?.LogInformation($"配置: TunnelIP={TunnelIP}, ListenPort={ListenPort}, Ports={string.Join(",", ports)}, TcpPorts={string.Join(",", tcpPorts)}, UdpPorts={string.Join(",", udpPorts)}, ClientID={config.ClientID}");
 
@@ -174,6 +182,28 @@ namespace TunRelayServer
             listener.Stop();
         }
 
+        static void ApplyCommandLine(string[] args, string configPath, TunRelayConfig config)
+        {
+            for (int i = 0; i < args.Length; i++)
+            {
+                switch (args[i])
+                {
+                    case "--AutoCredentials":
+                    case "--auto-credentials":
+                        bool enabled = true;
+                        if (i + 1 < args.Length && bool.TryParse(args[i + 1], out var parsed))
+                        {
+                            enabled = parsed;
+                            i++;
+                        }
+
+                        config.AutoCredentials = enabled;
+                        Console.WriteLine($"AutoCredentials={(enabled ? "true" : "false")}");
+                        break;
+                }
+            }
+        }
+
         static void LoadConfig(TunRelayConfig config)
         {
             TunnelIP = config.TunIp;
@@ -195,11 +225,31 @@ namespace TunRelayServer
             ValidatePorts("TcpPorts", tcpPorts);
             ValidatePorts("UdpPorts", udpPorts);
 
-            if (string.IsNullOrWhiteSpace(config.ClientID))
+            if (string.IsNullOrWhiteSpace(config.ClientID) && !config.AutoCredentials)
             {
-                logger?.LogError("config.json: ClientID 不能为空");
-                throw new InvalidOperationException("config.json: ClientID 不能为空");
+                logger?.LogWarning("config.json: ClientID 为空，正常认证会失败；可在 shell 输入 autocred on 开启一次性客户端自动配置");
             }
+        }
+
+        public static void SetAutoCredentials(bool enabled)
+        {
+            if (CurrentConfig == null)
+            {
+                Console.WriteLine("[shell] 配置尚未加载");
+                return;
+            }
+
+            CurrentConfig.AutoCredentials = enabled;
+
+            string status = enabled ? "开启" : "关闭";
+            string hint = enabled ? "，下一个未配置客户端成功配置后会自动关闭" : "";
+            logger?.LogWarning($"AutoCredentials 已{status}{hint}");
+            Console.WriteLine($"[shell] AutoCredentials 已{status}{hint}");
+        }
+
+        public static bool GetAutoCredentials()
+        {
+            return CurrentConfig?.AutoCredentials ?? false;
         }
 
         static int[] NormalizePorts(IEnumerable<int> values)

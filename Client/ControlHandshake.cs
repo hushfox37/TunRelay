@@ -14,11 +14,13 @@ namespace TunRelayClient
     internal sealed class ControlHandshake
     {
         private readonly TunRelayConfig _config;
+        private readonly string _configPath;
         private readonly ILogger _logger;
 
-        public ControlHandshake(TunRelayConfig config, ILogger logger)
+        public ControlHandshake(TunRelayConfig config, string configPath, ILogger logger)
         {
             _config = config;
+            _configPath = configPath;
             _logger = logger;
         }
 
@@ -99,6 +101,9 @@ namespace TunRelayClient
 
         private async Task<bool> AuthenticateAsync(TunnelNet tunnelNet, CancellationToken ct)
         {
+            if (string.IsNullOrWhiteSpace(_config.Secret))
+                return await RequestCredentialsAsync(tunnelNet, ct);
+
             byte[] key = Encoding.UTF8.GetBytes(_config.Secret);
             long timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             string signData = $"{_config.ClientID}:{timestamp}";
@@ -116,6 +121,43 @@ namespace TunRelayClient
             var response = await tunnelNet.ReceiveControlAsync(ct);
             _logger.LogInformation($"[AUTH] 服务端响应: {response}");
             return response == "Success";
+        }
+
+        private async Task<bool> RequestCredentialsAsync(TunnelNet tunnelNet, CancellationToken ct)
+        {
+            var json = JsonSerializer.Serialize(
+                new CredentialProvisioningRequest { Mode = "AutoCredentials", ClientID = _config.ClientID },
+                TunRelayJsonContext.Default.CredentialProvisioningRequest);
+
+            _logger.LogWarning($"[AUTH] 发送自动配置请求 ClientID={_config.ClientID}");
+            await tunnelNet.SendControlAsync(json, ct);
+
+            var response = await tunnelNet.ReceiveControlAsync(ct);
+            CredentialProvisioningResponse? payload;
+            try
+            {
+                payload = JsonSerializer.Deserialize(
+                    response,
+                    TunRelayJsonContext.Default.CredentialProvisioningResponse);
+            }
+            catch (JsonException)
+            {
+                _logger.LogError($"[AUTH] 自动配置失败，服务端响应无效: {response}");
+                return false;
+            }
+
+            if (payload == null
+                || !string.Equals(payload.Status, "Success", StringComparison.Ordinal)
+                || string.IsNullOrWhiteSpace(payload.Secret))
+            {
+                _logger.LogError("[AUTH] 自动配置被服务端拒绝，请确认服务端已使用 --AutoCredentials 开启一次性配置");
+                return false;
+            }
+
+            _config.Secret = payload.Secret;
+            ConfigManager.Save(_configPath, _config);
+            _logger.LogWarning("已从服务端获取 Secret 并写入 config.json");
+            return true;
         }
     }
 }

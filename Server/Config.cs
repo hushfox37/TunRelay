@@ -11,6 +11,8 @@ public class TunRelayConfig
     public int[] UdpPorts { get; set; } = Array.Empty<int>();
     public string ClientID { get; set; } = "";
     public string Secret { get; set; } = "";
+    [JsonIgnore]
+    public bool AutoCredentials { get; set; }
     public string LogLevel { get; set; } = "Information";
 
     // 数据通道微批处理参数(运行时会做边界归一化)
@@ -79,10 +81,24 @@ namespace TunRelayServer
         public string Sign { get; set; } = "";
     }
 
+    sealed class CredentialProvisioningRequest
+    {
+        public string Mode { get; set; } = "";
+        public string ClientID { get; set; } = "";
+    }
+
+    sealed class CredentialProvisioningResponse
+    {
+        public string Status { get; set; } = "";
+        public string Secret { get; set; } = "";
+    }
+
     [JsonSerializable(typeof(TunRelayConfig))]
     [JsonSerializable(typeof(ServerConfigPayload))]
     [JsonSerializable(typeof(DataChannelHandshake))]
     [JsonSerializable(typeof(AuthenticationRequest))]
+    [JsonSerializable(typeof(CredentialProvisioningRequest))]
+    [JsonSerializable(typeof(CredentialProvisioningResponse))]
     [JsonSourceGenerationOptions(WriteIndented = true)]
     partial class TunRelayJsonContext : JsonSerializerContext
     {

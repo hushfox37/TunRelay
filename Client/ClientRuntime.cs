@@ -11,12 +11,12 @@ namespace TunRelayClient
         private readonly ReconnectPolicy _reconnectPolicy;
         private readonly ControlHandshake _controlHandshake;
 
-        public ClientRuntime(TunRelayConfig config, ILogger logger)
+        public ClientRuntime(TunRelayConfig config, string configPath, ILogger logger)
         {
             _config = config;
             _logger = logger;
             _reconnectPolicy = ReconnectPolicy.FromConfig(config);
-            _controlHandshake = new ControlHandshake(config, logger);
+            _controlHandshake = new ControlHandshake(config, configPath, logger);
         }
 
         public async Task RunAsync(CancellationToken ct)

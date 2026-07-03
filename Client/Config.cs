@@ -79,9 +79,23 @@ public sealed class AuthenticationRequest
     public string Sign { get; set; } = "";
 }
 
+public sealed class CredentialProvisioningRequest
+{
+    public string Mode { get; set; } = "";
+    public string ClientID { get; set; } = "";
+}
+
+public sealed class CredentialProvisioningResponse
+{
+    public string Status { get; set; } = "";
+    public string Secret { get; set; } = "";
+}
+
 [JsonSerializable(typeof(TunRelayConfig))]
 [JsonSerializable(typeof(DataChannelHandshake))]
 [JsonSerializable(typeof(AuthenticationRequest))]
+[JsonSerializable(typeof(CredentialProvisioningRequest))]
+[JsonSerializable(typeof(CredentialProvisioningResponse))]
 [JsonSourceGenerationOptions(WriteIndented = true)]
 public partial class TunRelayJsonContext : JsonSerializerContext
 {
