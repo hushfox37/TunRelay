@@ -200,8 +200,93 @@ namespace TunRelayServer
                         config.AutoCredentials = enabled;
                         Console.WriteLine($"AutoCredentials={(enabled ? "true" : "false")}");
                         break;
+                    case "--ServerIP":
+                    case "--server-ip":
+                        config.ServerIP = ReadValue(args, ref i);
+                        break;
+                    case "--ListenPort":
+                    case "--listen-port":
+                        config.ListenPort = ParsePort(ReadValue(args, ref i), "ListenPort");
+                        break;
+                    case "--TunIp":
+                    case "--tun-ip":
+                        config.TunIp = ReadValue(args, ref i);
+                        break;
+                    case "--TcpPorts":
+                    case "--tcp-ports":
+                        config.TcpPorts = ParsePorts(ReadValue(args, ref i), "TcpPorts");
+                        break;
+                    case "--UdpPorts":
+                    case "--udp-ports":
+                        config.UdpPorts = ParsePorts(ReadValue(args, ref i), "UdpPorts");
+                        break;
+                    case "--ClientID":
+                    case "--client-id":
+                        config.ClientID = ReadValue(args, ref i);
+                        break;
+                    case "--Secret":
+                    case "--secret":
+                        config.Secret = ReadValue(args, ref i);
+                        break;
+                    case "--LogLevel":
+                    case "--log-level":
+                        config.LogLevel = ReadValue(args, ref i);
+                        break;
+                    case "--UplinkConnections":
+                    case "--uplink-connections":
+                        config.UplinkConnections = ParseInt(ReadValue(args, ref i), "UplinkConnections");
+                        break;
+                    case "--DownlinkConnections":
+                    case "--downlink-connections":
+                        config.DownlinkConnections = ParseInt(ReadValue(args, ref i), "DownlinkConnections");
+                        break;
+                    case "--BatchDelayMs":
+                    case "--batch-delay-ms":
+                        config.BatchDelayMs = ParseInt(ReadValue(args, ref i), "BatchDelayMs");
+                        break;
+                    case "--MaxBatchBytes":
+                    case "--max-batch-bytes":
+                        config.MaxBatchBytes = ParseInt(ReadValue(args, ref i), "MaxBatchBytes");
+                        break;
+                    case "--MaxBatchPackets":
+                    case "--max-batch-packets":
+                        config.MaxBatchPackets = ParseInt(ReadValue(args, ref i), "MaxBatchPackets");
+                        break;
                 }
             }
+        }
+
+        static string ReadValue(string[] args, ref int index)
+        {
+            if (index + 1 >= args.Length)
+                throw new ArgumentException($"Missing value for {args[index]}");
+            return args[++index];
+        }
+
+        static int ParseInt(string value, string name)
+        {
+            if (!int.TryParse(value, out var result))
+                throw new ArgumentException($"{name} must be an integer");
+            return result;
+        }
+
+        static int ParsePort(string value, string name)
+        {
+            int port = ParseInt(value, name);
+            if (port <= 0 || port > 65535)
+                throw new ArgumentException($"{name} must be 1-65535");
+            return port;
+        }
+
+        static int[] ParsePorts(string value, string name)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return Array.Empty<int>();
+
+            return value
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(port => ParsePort(port, name))
+                .ToArray();
         }
 
         static void LoadConfig(TunRelayConfig config)

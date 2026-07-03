@@ -20,10 +20,9 @@ namespace TunRelayClient
 
         static async Task Main(string[] args)
         {
-            HandleCommandLine(args, ConfigPath);
-
             // 先加载配置并同步到旧静态字段，供现有 TUN/DataChannel 代码读取。
             var config = ConfigManager.LoadOrCreate(ConfigPath);
+            ApplyCommandLine(args, config);
             CurrentConfig = config;
             ServerIP = config.ServerIp;
             ServerPort = config.EffectiveServerPort;
@@ -70,24 +69,76 @@ namespace TunRelayClient
             }
         }
 
-        private static void HandleCommandLine(string[] args, string configPath)
+        private static void ApplyCommandLine(string[] args, TunRelayConfig config)
         {
             for (int i = 0; i < args.Length; i++)
             {
                 switch (args[i])
                 {
                     case "--Secret":
-                        if (i + 1 < args.Length)
-                        {
-                            ConfigManager.Update(configPath, config =>
-                            {
-                                config.Secret = args[++i];
-                            });
-                            Console.WriteLine("已更新 Secret 到 config.json");
-                        }
+                    case "--secret":
+                        config.Secret = ReadValue(args, ref i);
+                        break;
+                    case "--ClientID":
+                    case "--client-id":
+                        config.ClientID = ReadValue(args, ref i);
+                        break;
+                    case "--ServerIP":
+                    case "--server-ip":
+                        config.ServerIp = ReadValue(args, ref i);
+                        break;
+                    case "--ServerPort":
+                    case "--server-port":
+                        config.ServerPorts = ParsePort(ReadValue(args, ref i), "ServerPort");
+                        break;
+                    case "--LogLevel":
+                    case "--log-level":
+                        config.LogLevel = ReadValue(args, ref i);
+                        break;
+                    case "--ReconnectDelayMs":
+                    case "--reconnect-delay-ms":
+                        config.ReconnectDelayMs = ParseInt(ReadValue(args, ref i), "ReconnectDelayMs");
+                        break;
+                    case "--MaxReconnectAttempts":
+                    case "--max-reconnect-attempts":
+                        config.MaxReconnectAttempts = ParseInt(ReadValue(args, ref i), "MaxReconnectAttempts");
+                        break;
+                    case "--BatchDelayMs":
+                    case "--batch-delay-ms":
+                        config.BatchDelayMs = ParseInt(ReadValue(args, ref i), "BatchDelayMs");
+                        break;
+                    case "--MaxBatchBytes":
+                    case "--max-batch-bytes":
+                        config.MaxBatchBytes = ParseInt(ReadValue(args, ref i), "MaxBatchBytes");
+                        break;
+                    case "--MaxBatchPackets":
+                    case "--max-batch-packets":
+                        config.MaxBatchPackets = ParseInt(ReadValue(args, ref i), "MaxBatchPackets");
                         break;
                 }
             }
+        }
+
+        private static string ReadValue(string[] args, ref int index)
+        {
+            if (index + 1 >= args.Length)
+                throw new ArgumentException($"Missing value for {args[index]}");
+            return args[++index];
+        }
+
+        private static int ParseInt(string value, string name)
+        {
+            if (!int.TryParse(value, out var result))
+                throw new ArgumentException($"{name} must be an integer");
+            return result;
+        }
+
+        private static int ParsePort(string value, string name)
+        {
+            int port = ParseInt(value, name);
+            if (port <= 0 || port > 65535)
+                throw new ArgumentException($"{name} must be 1-65535");
+            return port;
         }
 
         private static ServiceProvider BuildServiceProvider(TunRelayConfig config)
