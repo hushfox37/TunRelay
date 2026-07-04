@@ -63,8 +63,16 @@ jobs:
         include:
           - project: client
             project-path: Client/TunRelayClient.csproj
+            os: ubuntu-latest
+            runtime: linux-x64
+          - project: client
+            project-path: Client/TunRelayClient.csproj
             os: ubuntu-24.04-arm
             runtime: linux-arm64
+          - project: server
+            project-path: Server/TunRelayServer.csproj
+            os: ubuntu-latest
+            runtime: linux-x64
           - project: client
             project-path: Client/TunRelayClient.csproj
             os: windows-latest
@@ -94,44 +102,3 @@ jobs:
         with:
           name: tunrelay-${{ matrix.project }}-${{ matrix.runtime }}
           path: artifacts/${{ matrix.project }}-${{ matrix.runtime }}
-
-  native-aot-linux-x64-lowglibc:
-    name: Native AOT low glibc (${{ matrix.project }} linux-x64)
-    needs: build
-    runs-on: ubuntu-latest
-    container: debian:11
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - project: client
-            project-path: Client/TunRelayClient.csproj
-          - project: server
-            project-path: Server/TunRelayServer.csproj
-
-    steps:
-      - name: Install build prerequisites
-        run: |
-          apt-get update
-          apt-get install -y ca-certificates curl git clang zlib1g-dev
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install .NET
-        run: |
-          curl -sSL https://dot.net/v1/dotnet-install.sh -o dotnet-install.sh
-          bash dotnet-install.sh --channel 10.0 --install-dir /usr/share/dotnet
-          ln -s /usr/share/dotnet/dotnet /usr/bin/dotnet
-          dotnet --info
-
-      - name: Publish Native AOT
-        run: dotnet publish "${{ matrix.project-path }}" --configuration "$BUILD_CONFIGURATION" --runtime linux-x64 --self-contained true --output "artifacts/${{ matrix.project }}-linux-x64"
-        shell: bash
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: tunrelay-${{ matrix.project }}-linux-x64
-          path: artifacts/${{ matrix.project }}-linux-x64
