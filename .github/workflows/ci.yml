@@ -102,7 +102,12 @@ jobs:
           sudo apt-get install -y clang musl-tools zlib1g-dev
 
       - name: Publish Native AOT
-        run: dotnet publish "${{ matrix.project-path }}" --configuration "$BUILD_CONFIGURATION" --runtime "${{ matrix.runtime }}" --self-contained true --output "artifacts/${{ matrix.project }}-${{ matrix.runtime }}"
+        run: |
+          extra_args=""
+          if [ "${{ matrix.runtime }}" = "linux-musl-x64" ]; then
+            extra_args="-p:StaticExecutable=true"
+          fi
+          dotnet publish "${{ matrix.project-path }}" --configuration "$BUILD_CONFIGURATION" --runtime "${{ matrix.runtime }}" --self-contained true $extra_args --output "artifacts/${{ matrix.project }}-${{ matrix.runtime }}"
         shell: bash
 
       - name: Upload artifact
