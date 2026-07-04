@@ -99,13 +99,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang musl-tools zlib1g-dev
+          sudo apt-get install -y clang lld musl-tools zlib1g-dev
 
       - name: Publish Native AOT
         run: |
           extra_args=""
           if [ "${{ matrix.runtime }}" = "linux-musl-x64" ]; then
-            extra_args="-p:StaticExecutable=true"
+            extra_args="-p:StaticExecutable=true -p:LinkerFlavor=lld"
           fi
           dotnet publish "${{ matrix.project-path }}" --configuration "$BUILD_CONFIGURATION" --runtime "${{ matrix.runtime }}" --self-contained true $extra_args --output "artifacts/${{ matrix.project }}-${{ matrix.runtime }}"
         shell: bash
