@@ -17,6 +17,7 @@ Linux with a TUN adapter.
 - Linux server based on `iptables` and `libnetfilter_queue`
 - Separate TCP and UDP forwarded port configuration
 - Server-controlled TUN IP and forwarded port delivery
+- Preserves the visitor source IP for services behind the client
 - Batched data channel with runtime tunnel statistics
 - Parallel data connections with stable per-flow routing
 - Startup command-line overrides for common runtime settings
@@ -82,6 +83,7 @@ The most important fields are:
 
 Traffic from the client machine to `<TunIp>:<forwarded-port>` goes through the
 tunnel and reaches the corresponding service-side port handled by the server.
+Services behind the client can still see the visitor's source IP.
 
 ### 3. Configure Credentials
 
