@@ -67,20 +67,12 @@ jobs:
             runtime: linux-x64
           - project: client
             project-path: Client/TunRelayClient.csproj
-            os: ubuntu-latest
-            runtime: linux-musl-x64
-          - project: client
-            project-path: Client/TunRelayClient.csproj
             os: ubuntu-24.04-arm
             runtime: linux-arm64
           - project: server
             project-path: Server/TunRelayServer.csproj
             os: ubuntu-latest
             runtime: linux-x64
-          - project: server
-            project-path: Server/TunRelayServer.csproj
-            os: ubuntu-latest
-            runtime: linux-musl-x64
           - project: client
             project-path: Client/TunRelayClient.csproj
             os: windows-latest
@@ -99,15 +91,10 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld musl-tools zlib1g-dev
+          sudo apt-get install -y clang zlib1g-dev
 
       - name: Publish Native AOT
-        run: |
-          extra_args=""
-          if [ "${{ matrix.runtime }}" = "linux-musl-x64" ]; then
-            extra_args="-p:StaticExecutable=true -p:LinkerFlavor=lld"
-          fi
-          dotnet publish "${{ matrix.project-path }}" --configuration "$BUILD_CONFIGURATION" --runtime "${{ matrix.runtime }}" --self-contained true $extra_args --output "artifacts/${{ matrix.project }}-${{ matrix.runtime }}"
+        run: dotnet publish "${{ matrix.project-path }}" --configuration "$BUILD_CONFIGURATION" --runtime "${{ matrix.runtime }}" --self-contained true --output "artifacts/${{ matrix.project }}-${{ matrix.runtime }}"
         shell: bash
 
       - name: Upload artifact
