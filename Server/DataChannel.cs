@@ -121,23 +121,32 @@ namespace TunRelayServer
             int payload = 1 + 2;
             foreach (var p in batch)
                 payload += 2 + p.Length;
-            int total = 4 + payload;
 
-            Span<byte> span = writer.GetSpan(total);
-            BinaryPrimitives.WriteInt32BigEndian(span, payload);
-            span[4] = FrameTypePacketBatch;
-            BinaryPrimitives.WriteUInt16BigEndian(span.Slice(5), (ushort)batch.Count);
-
-            int off = 7;
+            Span<byte> frameHeader = writer.GetSpan(7);
+            BinaryPrimitives.WriteInt32BigEndian(frameHeader, payload);
+            frameHeader[4] = FrameTypePacketBatch;
+            BinaryPrimitives.WriteUInt16BigEndian(frameHeader.Slice(5), (ushort)batch.Count);
+            writer.Advance(7);
+            
             foreach (var p in batch)
             {
-                BinaryPrimitives.WriteUInt16BigEndian(span.Slice(off), (ushort)p.Length);
-                off += 2;
-                p.ReadOnlyMemory.Span.CopyTo(span.Slice(off));
-                off += p.Length;
+                Span<byte> packetHeader = writer.GetSpan(2);
+                BinaryPrimitives.WriteUInt16BigEndian(packetHeader, (ushort)p.Length);
+                writer.Advance(2);
+                WritePacket(writer, p.ReadOnlyMemory);
             }
+        }
 
-            writer.Advance(total);
+        private static void WritePacket(PipeWriter writer, ReadOnlyMemory<byte> packet)
+        {
+            while (!packet.IsEmpty)
+            {
+                Memory<byte> destination = writer.GetMemory(packet.Length);
+                int count = Math.Min(destination.Length, packet.Length);
+                packet.Slice(0, count).CopyTo(destination);
+                writer.Advance(count);
+                packet = packet.Slice(count);
+            }
         }
 
         /// <summary>

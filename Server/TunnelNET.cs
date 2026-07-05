@@ -7,7 +7,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using Newtonsoft.Json;
+using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -71,16 +71,12 @@ namespace TunRelayServer
     static class ServerNet
     {
         static ILogger _logger;
-        sealed class AuthenticationRequest
-        {
-            public string ClientID { get; set; } = "";
-            public long Timestamp { get; set; }
-            public string Sign { get; set; } = "";
-        }
+        static string _configPath = "config.json";
 
-        public static void Init(ILogger logger)
+        public static void Init(ILogger logger, string configPath)
         {
             _logger = logger;
+            _configPath = configPath;
         }
 
         // 接受一条控制连接并完成认证;成功则生成 sessionId 一并返回。失败则继续等待下一个。
@@ -102,10 +98,25 @@ namespace TunRelayServer
                 {
                     await controlSsl.AuthenticateAsServerAsync(cert, false, false);
                     _logger?.LogInformation($"控制连接来自 {controlTcp.Client.RemoteEndPoint}");
-                    _logger?.LogInformation("[AUTH] 等待客户端认证...");
-                    authenticated = await AuthenticateClientAsync(controlSsl, config, ct);
-                    await SendAsync(controlSsl, Encoding.UTF8.GetBytes(authenticated ? "Success" : "Failed"), ct);
-                    _logger?.LogInformation($"[AUTH] 已返回认证结果: {(authenticated ? "Success" : "Failed")}");
+
+                    using var authData = await ReceiveAsync(controlSsl, ct);
+                    string authJson = Encoding.UTF8.GetString(authData.Buffer, 0, authData.Length);
+                    var provisioningRequest = JsonSerializer.Deserialize(
+                        authJson,
+                        TunRelayJsonContext.Default.CredentialProvisioningRequest);
+
+                    if (provisioningRequest != null
+                        && string.Equals(provisioningRequest.Mode, "AutoCredentials", StringComparison.Ordinal))
+                    {
+                        authenticated = await ProvisionCredentialsAsync(controlSsl, config, provisioningRequest, ct);
+                    }
+                    else
+                    {
+                        _logger?.LogInformation("[AUTH] 等待客户端认证...");
+                        authenticated = AuthenticateClient(authJson, config);
+                        await SendAsync(controlSsl, Encoding.UTF8.GetBytes(authenticated ? "Success" : "Failed"), ct);
+                        _logger?.LogInformation($"[AUTH] 已返回认证结果: {(authenticated ? "Success" : "Failed")}");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -125,6 +136,50 @@ namespace TunRelayServer
             }
 
             throw new OperationCanceledException(ct);
+        }
+
+        static async Task<bool> ProvisionCredentialsAsync(
+            SslStream controlSsl,
+            TunRelayConfig config,
+            CredentialProvisioningRequest request,
+            CancellationToken ct)
+        {
+            if (!config.AutoCredentials)
+            {
+                _logger?.LogWarning("[AUTH] 拒绝自动配置: AutoCredentials 未开启");
+                await SendCredentialProvisioningResponseAsync(controlSsl, "Failed", "", ct);
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(request.ClientID))
+            {
+                _logger?.LogWarning("[AUTH] 拒绝自动配置: ClientID 为空");
+                await SendCredentialProvisioningResponseAsync(controlSsl, "Failed", "", ct);
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(config.Secret))
+                config.Secret = GenerateSecret();
+
+            config.ClientID = request.ClientID;
+            config.AutoCredentials = false;
+            ConfigManager.Save(_configPath, config);
+
+            await SendCredentialProvisioningResponseAsync(controlSsl, "Success", config.Secret, ct);
+            _logger?.LogWarning($"[AUTH] 已为客户端 {config.ClientID} 自动配置凭据，AutoCredentials 已关闭");
+            return true;
+        }
+
+        static async Task SendCredentialProvisioningResponseAsync(
+            SslStream controlSsl,
+            string status,
+            string secret,
+            CancellationToken ct)
+        {
+            var json = JsonSerializer.Serialize(
+                new CredentialProvisioningResponse { Status = status, Secret = secret },
+                TunRelayJsonContext.Default.CredentialProvisioningResponse);
+            await SendAsync(controlSsl, Encoding.UTF8.GetBytes(json), ct);
         }
 
         // 组装 N 条上行 + N 条下行数据连接: 每条 TLS 握手后读取 {SessionId, Role, Index},校验 sessionId 后归位。
@@ -157,8 +212,9 @@ namespace TunRelayServer
                     {
                         await ssl.AuthenticateAsServerAsync(cert, false, false);
                         using var data = await ReceiveAsync(ssl, timeoutCts.Token);
-                        var hs = JsonConvert.DeserializeObject<DataChannelHandshake>(
-                            Encoding.UTF8.GetString(data.Buffer, 0, data.Length));
+                        var hs = JsonSerializer.Deserialize(
+                            Encoding.UTF8.GetString(data.Buffer, 0, data.Length),
+                            TunRelayJsonContext.Default.DataChannelHandshake);
 
                         if (hs == null
                             || !FixedTimeHexEquals(hs.SessionId, control.SessionId)
@@ -201,11 +257,9 @@ namespace TunRelayServer
             }
         }
 
-        static async Task<bool> AuthenticateClientAsync(SslStream controlSsl, TunRelayConfig config, CancellationToken ct)
+        static bool AuthenticateClient(string json, TunRelayConfig config)
         {
-            using var data = await ReceiveAsync(controlSsl, ct);
-            string json = Encoding.UTF8.GetString(data.Buffer, 0, data.Length);
-            var request = JsonConvert.DeserializeObject<AuthenticationRequest>(json);
+            var request = JsonSerializer.Deserialize(json, TunRelayJsonContext.Default.AuthenticationRequest);
             if (request == null)
             {
                 _logger?.LogWarning("[AUTH] 失败: 请求格式无效");

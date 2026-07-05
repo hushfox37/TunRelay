@@ -96,6 +96,9 @@ namespace TunRelayServer
             "命令:\n" +
             "  stats        打印当前统计快照\n" +
             "  stats reset  清零统计\n" +
+            "  autocred on      开启一次性客户端自动配置\n" +
+            "  autocred off     关闭一次性客户端自动配置\n" +
+            "  autocred status  查看一次性客户端自动配置状态\n" +
             "  help         显示帮助";
 
         public static async Task RunAsync(CancellationToken ct)
@@ -123,7 +126,14 @@ namespace TunRelayServer
                 if (line == null)
                     break;
 
-                switch (line.Trim())
+                var command = line.Trim();
+                if (command.StartsWith("autocred ", StringComparison.OrdinalIgnoreCase))
+                {
+                    HandleAutoCredentials(command["autocred ".Length..].Trim());
+                    continue;
+                }
+
+                switch (command)
                 {
                     case "":
                         break;
@@ -134,15 +144,50 @@ namespace TunRelayServer
                         TunnelStats.Reset();
                         Console.WriteLine("[shell] 统计已清零");
                         break;
+                    case "autocred":
+                    case "autocred status":
+                        PrintAutoCredentialsStatus();
+                        break;
                     case "help":
                     case "?":
                         Console.WriteLine(HelpText);
                         break;
                     default:
-                        Console.WriteLine($"[shell] 未知命令: {line.Trim()} (输入 help)");
+                        Console.WriteLine($"[shell] 未知命令: {command} (输入 help)");
                         break;
                 }
             }
+        }
+
+        private static void HandleAutoCredentials(string value)
+        {
+            switch (value.ToLowerInvariant())
+            {
+                case "on":
+                case "true":
+                case "enable":
+                case "enabled":
+                    Program.SetAutoCredentials(true);
+                    break;
+                case "off":
+                case "false":
+                case "disable":
+                case "disabled":
+                    Program.SetAutoCredentials(false);
+                    break;
+                case "":
+                case "status":
+                    PrintAutoCredentialsStatus();
+                    break;
+                default:
+                    Console.WriteLine("[shell] 用法: autocred on | off | status");
+                    break;
+            }
+        }
+
+        private static void PrintAutoCredentialsStatus()
+        {
+            Console.WriteLine($"[shell] AutoCredentials={(Program.GetAutoCredentials() ? "on" : "off")}");
         }
     }
 }
