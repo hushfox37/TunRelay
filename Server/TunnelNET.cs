@@ -37,25 +37,25 @@ namespace TunRelayServer
     // 一个会话: 控制连接 + N 条上行(client->server, server 读) + N 条下行(server->client, server 写)
     sealed class Session : IDisposable
     {
-        public Session(ControlChannel control, SslStream[] txSsl, SslStream[] rxSsl, List<TcpClient> dataTcp, List<SslStream> dataSsl)
+        public Session(ControlChannel control, Stream[] txStreams, Stream[] rxStreams, List<TcpClient> dataTcp, List<Stream> dataStreams)
         {
             Control = control;
-            TxSsl = txSsl;
-            RxSsl = rxSsl;
+            TxStreams = txStreams;
+            RxStreams = rxStreams;
             _dataTcp = dataTcp;
-            _dataSsl = dataSsl;
+            _dataStreams = dataStreams;
         }
 
         public ControlChannel Control { get; }
-        public SslStream[] TxSsl { get; } // 上行: server 读 -> RawSender
-        public SslStream[] RxSsl { get; } // 下行: server 写 <- downlinkChannels
+        public Stream[] TxStreams { get; }
+        public Stream[] RxStreams { get; }
 
         private readonly List<TcpClient> _dataTcp;
-        private readonly List<SslStream> _dataSsl;
+        private readonly List<Stream> _dataStreams;
 
         public void Dispose()
         {
-            foreach (var s in _dataSsl) s.Dispose();
+            foreach (var stream in _dataStreams) stream.Dispose();
             foreach (var t in _dataTcp) t.Dispose();
             Control.Dispose();
         }
@@ -108,13 +108,32 @@ namespace TunRelayServer
                     if (provisioningRequest != null
                         && string.Equals(provisioningRequest.Mode, "AutoCredentials", StringComparison.Ordinal))
                     {
-                        authenticated = await ProvisionCredentialsAsync(controlSsl, config, provisioningRequest, ct);
+                        var protocol = DataChannelProtocolCodec.Parse(config.Protocol);
+                        if (!DataChannelProtocolCodec.IsSupported(provisioningRequest.SupportedProtocols, protocol))
+                        {
+                            string error = $"UnsupportedProtocol:{DataChannelProtocolCodec.ToWire(protocol)}";
+                            await SendCredentialProvisioningResponseAsync(controlSsl, "Failed", "", error, ct);
+                        }
+                        else
+                        {
+                            authenticated = await ProvisionCredentialsAsync(controlSsl, config, provisioningRequest, ct);
+                        }
                     }
                     else
                     {
                         _logger?.LogInformation("[AUTH] 等待客户端认证...");
-                        authenticated = AuthenticateClient(authJson, config);
-                        await SendAsync(controlSsl, Encoding.UTF8.GetBytes(authenticated ? "Success" : "Failed"), ct);
+                        var request = JsonSerializer.Deserialize(
+                            authJson,
+                            TunRelayJsonContext.Default.AuthenticationRequest);
+                        authenticated = AuthenticateClient(request, config);
+                        string response = authenticated ? "Success" : "Failed";
+                        var protocol = DataChannelProtocolCodec.Parse(config.Protocol);
+                        if (authenticated && !DataChannelProtocolCodec.IsSupported(request?.SupportedProtocols, protocol))
+                        {
+                            authenticated = false;
+                            response = $"UnsupportedProtocol:{DataChannelProtocolCodec.ToWire(protocol)}";
+                        }
+                        await SendAsync(controlSsl, Encoding.UTF8.GetBytes(response), ct);
                         _logger?.LogInformation($"[AUTH] 已返回认证结果: {(authenticated ? "Success" : "Failed")}");
                     }
                 }
@@ -147,14 +166,14 @@ namespace TunRelayServer
             if (!config.AutoCredentials)
             {
                 _logger?.LogWarning("[AUTH] 拒绝自动配置: AutoCredentials 未开启");
-                await SendCredentialProvisioningResponseAsync(controlSsl, "Failed", "", ct);
+                await SendCredentialProvisioningResponseAsync(controlSsl, "Failed", "", "", ct);
                 return false;
             }
 
             if (string.IsNullOrWhiteSpace(request.ClientID))
             {
                 _logger?.LogWarning("[AUTH] 拒绝自动配置: ClientID 为空");
-                await SendCredentialProvisioningResponseAsync(controlSsl, "Failed", "", ct);
+                await SendCredentialProvisioningResponseAsync(controlSsl, "Failed", "", "", ct);
                 return false;
             }
 
@@ -165,7 +184,7 @@ namespace TunRelayServer
             config.AutoCredentials = false;
             ConfigManager.Save(_configPath, config);
 
-            await SendCredentialProvisioningResponseAsync(controlSsl, "Success", config.Secret, ct);
+            await SendCredentialProvisioningResponseAsync(controlSsl, "Success", config.Secret, "", ct);
             _logger?.LogWarning($"[AUTH] 已为客户端 {config.ClientID} 自动配置凭据，AutoCredentials 已关闭");
             return true;
         }
@@ -174,28 +193,31 @@ namespace TunRelayServer
             SslStream controlSsl,
             string status,
             string secret,
+            string error,
             CancellationToken ct)
         {
             var json = JsonSerializer.Serialize(
-                new CredentialProvisioningResponse { Status = status, Secret = secret },
+                new CredentialProvisioningResponse { Status = status, Secret = secret, Error = error },
                 TunRelayJsonContext.Default.CredentialProvisioningResponse);
             await SendAsync(controlSsl, Encoding.UTF8.GetBytes(json), ct);
         }
 
-        // 组装 N 条上行 + N 条下行数据连接: 每条 TLS 握手后读取 {SessionId, Role, Index},校验 sessionId 后归位。
+        // 组装 N 条上行 + N 条下行数据连接: 打开所选传输后读取 {SessionId, Role, Index},校验 sessionId 后归位。
         // 带超时;未在期限内集齐则视为失败(抛异常,由上层重来)。
         public static async Task<Session> AssembleDataConnectionsAsync(
             TcpListener listener,
             X509Certificate2 cert,
             ControlChannel control,
+            DataChannelProtocol protocol,
             int uplink,
             int downlink,
             CancellationToken ct)
         {
-            var txSsl = new SslStream[uplink];
-            var rxSsl = new SslStream[downlink];
+            var txStreams = new Stream[uplink];
+            var rxStreams = new Stream[downlink];
             var dataTcp = new List<TcpClient>(uplink + downlink);
-            var dataSsl = new List<SslStream>(uplink + downlink);
+            var dataStreams = new List<Stream>(uplink + downlink);
+            var adapter = DataChannelServerAdapter.Create(protocol);
             int got = 0, need = uplink + downlink;
 
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -207,11 +229,11 @@ namespace TunRelayServer
                 {
                     var tcp = await listener.AcceptTcpClientAsync(timeoutCts.Token);
                     tcp.NoDelay = true;
-                    var ssl = new SslStream(tcp.GetStream(), false);
+                    Stream? stream = null;
                     try
                     {
-                        await ssl.AuthenticateAsServerAsync(cert, false, false);
-                        using var data = await ReceiveAsync(ssl, timeoutCts.Token);
+                        stream = await adapter.OpenAsync(tcp, cert, timeoutCts.Token);
+                        using var data = await ReceiveAsync(stream, timeoutCts.Token);
                         var hs = JsonSerializer.Deserialize(
                             Encoding.UTF8.GetString(data.Buffer, 0, data.Length),
                             TunRelayJsonContext.Default.DataChannelHandshake);
@@ -222,44 +244,43 @@ namespace TunRelayServer
                             || (hs.Role != "tx" && hs.Role != "rx")
                             || (hs.Role == "tx" && hs.Index >= uplink)
                             || (hs.Role == "rx" && hs.Index >= downlink)
-                            || (hs.Role == "tx" && txSsl[hs.Index] != null)
-                            || (hs.Role == "rx" && rxSsl[hs.Index] != null))
+                            || (hs.Role == "tx" && txStreams[hs.Index] != null)
+                            || (hs.Role == "rx" && rxStreams[hs.Index] != null))
                         {
                             _logger?.LogWarning($"[ASM] 拒绝数据连接 (sessionId/role/index 非法或重复)");
-                            ssl.Dispose();
+                            stream.Dispose();
                             tcp.Dispose();
                             continue;
                         }
 
-                        if (hs.Role == "tx") txSsl[hs.Index] = ssl;
-                        else rxSsl[hs.Index] = ssl;
+                        if (hs.Role == "tx") txStreams[hs.Index] = stream;
+                        else rxStreams[hs.Index] = stream;
                         dataTcp.Add(tcp);
-                        dataSsl.Add(ssl);
+                        dataStreams.Add(stream);
                         got++;
                         _logger?.LogInformation($"[ASM] 数据连接 {hs.Role}#{hs.Index} 就位 ({got}/{need})");
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {
                         _logger?.LogWarning($"[ASM] 数据连接握手失败: {ex.Message}");
-                        ssl.Dispose();
+                        stream?.Dispose();
                         tcp.Dispose();
                     }
                 }
 
                 _logger?.LogInformation($"会话已集齐: 上行 {uplink} 条, 下行 {downlink} 条");
-                return new Session(control, txSsl, rxSsl, dataTcp, dataSsl);
+                return new Session(control, txStreams, rxStreams, dataTcp, dataStreams);
             }
             catch
             {
-                foreach (var s in dataSsl) s.Dispose();
+                foreach (var stream in dataStreams) stream.Dispose();
                 foreach (var t in dataTcp) t.Dispose();
                 throw;
             }
         }
 
-        static bool AuthenticateClient(string json, TunRelayConfig config)
+        static bool AuthenticateClient(AuthenticationRequest? request, TunRelayConfig config)
         {
-            var request = JsonSerializer.Deserialize(json, TunRelayJsonContext.Default.AuthenticationRequest);
             if (request == null)
             {
                 _logger?.LogWarning("[AUTH] 失败: 请求格式无效");
@@ -291,14 +312,14 @@ namespace TunRelayServer
             return true;
         }
 
-        public static async Task SendAsync(SslStream ssl, ReadOnlyMemory<byte> data, CancellationToken ct)
+        public static async Task SendAsync(Stream stream, ReadOnlyMemory<byte> data, CancellationToken ct)
         {
             var buffer = ArrayPool<byte>.Shared.Rent(4 + data.Length);
             try
             {
                 BinaryPrimitives.WriteInt32BigEndian(buffer, data.Length);
                 data.CopyTo(buffer.AsMemory(4));
-                await ssl.WriteAsync(buffer.AsMemory(0, 4 + data.Length), ct);
+                await stream.WriteAsync(buffer.AsMemory(0, 4 + data.Length), ct);
             }
             finally
             {
@@ -306,13 +327,13 @@ namespace TunRelayServer
             }
         }
 
-        public static async Task<PacketBuffer> ReceiveAsync(SslStream ssl, CancellationToken ct)
+        public static async Task<PacketBuffer> ReceiveAsync(Stream stream, CancellationToken ct)
         {
             var lenBuf = ArrayPool<byte>.Shared.Rent(4);
             int totalLen;
             try
             {
-                await ssl.ReadExactlyAsync(lenBuf.AsMemory(0, 4), ct);
+                await stream.ReadExactlyAsync(lenBuf.AsMemory(0, 4), ct);
                 totalLen = BinaryPrimitives.ReadInt32BigEndian(lenBuf.AsSpan(0, 4));
             }
             finally
@@ -326,7 +347,7 @@ namespace TunRelayServer
             var payload = PacketBuffer.Rent(totalLen);
             try
             {
-                await ssl.ReadExactlyAsync(payload.Memory, ct);
+                await stream.ReadExactlyAsync(payload.Memory, ct);
                 return payload;
             }
             catch

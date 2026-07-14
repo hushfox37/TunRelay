@@ -28,10 +28,11 @@ namespace TunRelayClient
             Program.TunnelIP = control.Assignment.TunnelIp;
             int uplink = control.Assignment.Uplink;
             int downlink = control.Assignment.Downlink;
+            var protocol = control.Assignment.Protocol;
             ApplyPortConfig(control.Assignment.Ports);
             RuntimeStatus.SetAssigned(uplink, downlink, control.Assignment.SessionId);
 
-            _logger.LogInformation($"服务端下发: TunnelIP={Program.TunnelIP}, Ports={string.Join(",", control.Assignment.Ports)}, Uplink={uplink}, Downlink={downlink}");
+            _logger.LogInformation($"服务端下发: TunnelIP={Program.TunnelIP}, Ports={string.Join(",", control.Assignment.Ports)}, Uplink={uplink}, Downlink={downlink}, Protocol={DataChannelProtocolCodec.ToWire(protocol)}");
 
             var uplinkChannels = CreateUplinkChannels(uplink);
 
@@ -49,7 +50,7 @@ namespace TunRelayClient
                 {
                     ApplyPortConfig(control.Assignment.Ports);
                     RuntimeStatus.SetSessionRunning(control.Assignment.SessionId);
-                    await RunSessionAsync(control.Net, control.Assignment.SessionId, uplinkChannels, uplink, downlink, batchOptions, ct);
+                    await RunSessionAsync(control.Net, control.Assignment.SessionId, protocol, uplinkChannels, uplink, downlink, batchOptions, ct);
                     _reconnectPolicy.Reset();
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -70,9 +71,9 @@ namespace TunRelayClient
                 _logger.LogWarning($"数据连接已断开，{(int)_reconnectPolicy.Delay.TotalMilliseconds} 毫秒后重连...");
                 await Task.Delay(_reconnectPolicy.Delay, ct);
 
-                control = await _controlHandshake.ConnectWithRetryAsync(_reconnectPolicy, ct, Program.TunnelIP, uplink, downlink);
+                control = await _controlHandshake.ConnectWithRetryAsync(_reconnectPolicy, ct, control.Assignment);
                 RuntimeStatus.SetAssigned(uplink, downlink, control.Assignment.SessionId);
-                _logger.LogInformation($"服务端下发: TunnelIP={control.Assignment.TunnelIp}, Ports={string.Join(",", control.Assignment.Ports)}, Uplink={control.Assignment.Uplink}, Downlink={control.Assignment.Downlink}");
+                _logger.LogInformation($"服务端下发: TunnelIP={control.Assignment.TunnelIp}, Ports={string.Join(",", control.Assignment.Ports)}, Uplink={control.Assignment.Uplink}, Downlink={control.Assignment.Downlink}, Protocol={DataChannelProtocolCodec.ToWire(control.Assignment.Protocol)}");
             }
         }
 
@@ -95,6 +96,7 @@ namespace TunRelayClient
         private async Task RunSessionAsync(
             TunnelNet net,
             string sessionId,
+            DataChannelProtocol protocol,
             Channel<PacketBuffer>[] uplinkChannels,
             int uplink,
             int downlink,
@@ -110,8 +112,8 @@ namespace TunRelayClient
                 // 丢弃断线期间积压的包，让新会话从干净队列开始。
                 DrainUplinkChannels(uplinkChannels);
 
-                await net.ConnectDataChannelsAsync(uplink, downlink, sessionId, sessionToken);
-                _logger.LogInformation($"数据连接已建立: 上行 {uplink} 条, 下行 {downlink} 条");
+                await net.ConnectDataChannelsAsync(uplink, downlink, sessionId, protocol, sessionToken);
+                _logger.LogInformation($"数据连接已建立: 上行 {uplink} 条, 下行 {downlink} 条, Protocol={DataChannelProtocolCodec.ToWire(protocol)}");
 
                 var txStreams = net.TxStreams;
                 for (int i = 0; i < uplink; i++)

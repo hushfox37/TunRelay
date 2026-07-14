@@ -24,6 +24,7 @@ namespace TunRelayServer
         private static int[] ports;
         private static int uplinkConnections;
         private static int downlinkConnections;
+        private static DataChannelProtocol dataChannelProtocol;
         private static TunRelayConfig CurrentConfig = null!;
         public static ILogger logger;
         private static BatchOptions batchOptions;
@@ -78,7 +79,9 @@ namespace TunRelayServer
             if (config.AutoCredentials)
                 logger?.LogWarning("AutoCredentials 已开启: 将允许下一个未配置客户端自动写入 ClientID/Secret，成功后会自动关闭");
 
-            logger?.LogInformation($"配置: TunnelIP={TunnelIP}, ListenPort={ListenPort}, Ports={string.Join(",", ports)}, TcpPorts={string.Join(",", tcpPorts)}, UdpPorts={string.Join(",", udpPorts)}, ClientID={config.ClientID}");
+            logger?.LogInformation($"配置: TunnelIP={TunnelIP}, ListenPort={ListenPort}, Ports={string.Join(",", ports)}, TcpPorts={string.Join(",", tcpPorts)}, UdpPorts={string.Join(",", udpPorts)}, ClientID={config.ClientID}, Protocol={DataChannelProtocolCodec.ToWire(dataChannelProtocol)}");
+            if (dataChannelProtocol == DataChannelProtocol.Tcp)
+                logger?.LogWarning("数据通道使用未加密 TCP；链路上的数据可被观察或篡改，控制通道仍使用 TLS");
 
             var cert = ServerNet.GenerateSelfSignedCertificate(config.ServerIP);
             var listener = new TcpListener(IPAddress.Any, ListenPort);
@@ -136,13 +139,14 @@ namespace TunRelayServer
                             UdpPorts = udpPorts,
                             UplinkConnections = uplinkConnections,
                             DownlinkConnections = downlinkConnections,
-                            SessionId = control.SessionId
+                            SessionId = control.SessionId,
+                            Protocol = DataChannelProtocolCodec.ToWire(dataChannelProtocol)
                         },
                         TunRelayJsonContext.Default.ServerConfigPayload);
                     await ServerNet.SendAsync(control.Ssl, Encoding.UTF8.GetBytes(json), cts.Token);
-                    logger?.LogInformation($"已下发配置: TunnelIP={TunnelIP}, Uplink={uplinkConnections}, Downlink={downlinkConnections}");
+                    logger?.LogInformation($"已下发配置: TunnelIP={TunnelIP}, Uplink={uplinkConnections}, Downlink={downlinkConnections}, Protocol={DataChannelProtocolCodec.ToWire(dataChannelProtocol)}");
 
-                    session = await ServerNet.AssembleDataConnectionsAsync(listener, cert, control, uplinkConnections, downlinkConnections, cts.Token);
+                    session = await ServerNet.AssembleDataConnectionsAsync(listener, cert, control, dataChannelProtocol, uplinkConnections, downlinkConnections, cts.Token);
                     control = null; // 所有权移交给 session
 
                     using var clientCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
@@ -150,12 +154,12 @@ namespace TunRelayServer
                     logger?.LogInformation("开始转发...");
 
                     var loops = new List<Task>(uplinkConnections + downlinkConnections);
-                    // 上行: server 读 TxSsl[i] -> RawSender
-                    foreach (var tx in session.TxSsl)
+                    // 上行: server 读 TxStreams[i] -> RawSender
+                    foreach (var tx in session.TxStreams)
                         loops.Add(ReceiveLoopAsync(tx, clientCts.Token));
-                    // 下行: server 把 downlinkChannels[i] 聚合 -> RxSsl[i]
-                    for (int i = 0; i < session.RxSsl.Length; i++)
-                        loops.Add(SendLoopAsync(session.RxSsl[i], _downlinkChannels[i].Reader, clientCts.Token));
+                    // 下行: server 把 downlinkChannels[i] 聚合 -> RxStreams[i]
+                    for (int i = 0; i < session.RxStreams.Length; i++)
+                        loops.Add(SendLoopAsync(session.RxStreams[i], _downlinkChannels[i].Reader, clientCts.Token));
 
                     await Task.WhenAny(loops);
                     clientCts.Cancel();
@@ -232,6 +236,10 @@ namespace TunRelayServer
                     case "--log-level":
                         config.LogLevel = ReadValue(args, ref i);
                         break;
+                    case "--Protocol":
+                    case "--protocol":
+                        config.Protocol = ReadValue(args, ref i);
+                        break;
                     case "--UplinkConnections":
                     case "--uplink-connections":
                         config.UplinkConnections = ParseInt(ReadValue(args, ref i), "UplinkConnections");
@@ -299,6 +307,7 @@ namespace TunRelayServer
 
             uplinkConnections = Math.Clamp(config.UplinkConnections, 1, 16);
             downlinkConnections = Math.Clamp(config.DownlinkConnections, 1, 16);
+            dataChannelProtocol = DataChannelProtocolCodec.Parse(config.Protocol);
 
             if (string.IsNullOrWhiteSpace(TunnelIP))
                 throw new InvalidOperationException("config.json: TunIp 不能为空");
@@ -358,13 +367,13 @@ namespace TunRelayServer
             }          
         }
 
-        // 下行: TLS Rx 解析 batch -> 直接逐包注入 Raw socket(不再经过 channel)
-        static async Task ReceiveLoopAsync(SslStream dataSsl, CancellationToken ct)
+        // 上行: 数据流解析 batch -> 直接逐包注入 Raw socket(不再经过 channel)
+        static async Task ReceiveLoopAsync(Stream dataStream, CancellationToken ct)
         {
             try
             {
                 await DataChannel.ReceiveLoopAsync(
-                    dataSsl,
+                    dataStream,
                     (packet, _) => { RawSender.Send(packet); return ValueTask.CompletedTask; },
                     ct);
             }
@@ -372,12 +381,12 @@ namespace TunRelayServer
             catch (Exception ex) { logger?.LogWarning($"数据连接断开(收): {ex.Message}"); }
         }
 
-        // 下行: 指定 channel 聚合成 batch -> TLS 写
-        static async Task SendLoopAsync(SslStream dataSsl, ChannelReader<PacketBuffer> reader, CancellationToken ct)
+        // 下行: 指定 channel 聚合成 batch -> 数据流写
+        static async Task SendLoopAsync(Stream dataStream, ChannelReader<PacketBuffer> reader, CancellationToken ct)
         {
             try
             {
-                await DataChannel.SendLoopAsync(reader, dataSsl, batchOptions, ct);
+                await DataChannel.SendLoopAsync(reader, dataStream, batchOptions, ct);
             }
             catch (OperationCanceledException) { }
             catch (Exception ex) { logger?.LogWarning($"数据连接断开(发): {ex.Message}"); }

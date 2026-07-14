@@ -18,9 +18,9 @@ namespace TunRelayClient
 
         // 多连接: 上行(client->server, role=tx) 与 下行(server->client, role=rx) 各 N 条。
         private TcpClient[] _txTcp = Array.Empty<TcpClient>();
-        private SslStream[] _txSsl = Array.Empty<SslStream>();
+        private Stream[] _txStreams = Array.Empty<Stream>();
         private TcpClient[] _rxTcp = Array.Empty<TcpClient>();
-        private SslStream[] _rxSsl = Array.Empty<SslStream>();
+        private Stream[] _rxStreams = Array.Empty<Stream>();
 
         public TunnelNet(string serverIP, int serverPort)
         {
@@ -39,42 +39,60 @@ namespace TunRelayClient
         }
 
         // 按服务端下发的数量建立 N 条上行 + N 条下行数据连接,每条先发握手头 {SessionId, Role, Index}。
-        public async Task ConnectDataChannelsAsync(int uplink, int downlink, string sessionId, CancellationToken ct = default)
+        internal async Task ConnectDataChannelsAsync(
+            int uplink,
+            int downlink,
+            string sessionId,
+            DataChannelProtocol protocol,
+            CancellationToken ct = default)
         {
+            var adapter = DataChannelClientAdapter.Create(protocol, ServerIP, ValidateServerCertificate);
             _txTcp = new TcpClient[uplink];
-            _txSsl = new SslStream[uplink];
+            _txStreams = new Stream[uplink];
             for (int i = 0; i < uplink; i++)
-                (_txTcp[i], _txSsl[i]) = await ConnectOneDataAsync(sessionId, "tx", i, ct);
+                (_txTcp[i], _txStreams[i]) = await ConnectOneDataAsync(sessionId, "tx", i, adapter, ct);
 
             _rxTcp = new TcpClient[downlink];
-            _rxSsl = new SslStream[downlink];
+            _rxStreams = new Stream[downlink];
             for (int i = 0; i < downlink; i++)
-                (_rxTcp[i], _rxSsl[i]) = await ConnectOneDataAsync(sessionId, "rx", i, ct);
+                (_rxTcp[i], _rxStreams[i]) = await ConnectOneDataAsync(sessionId, "rx", i, adapter, ct);
         }
 
-        private async Task<(TcpClient, SslStream)> ConnectOneDataAsync(string sessionId, string role, int index, CancellationToken ct)
+        private async Task<(TcpClient, Stream)> ConnectOneDataAsync(
+            string sessionId,
+            string role,
+            int index,
+            IDataChannelClientAdapter adapter,
+            CancellationToken ct)
         {
             var tcp = new TcpClient();
-            await tcp.ConnectAsync(ServerIP, ServerPort, ct);
-            tcp.NoDelay = true;
-            var ssl = new SslStream(tcp.GetStream(), false, ValidateServerCertificate, null);
-            await ssl.AuthenticateAsClientAsync(ServerIP);
+            try
+            {
+                await tcp.ConnectAsync(ServerIP, ServerPort, ct);
+                tcp.NoDelay = true;
+                var stream = await adapter.OpenAsync(tcp, ct);
 
-            var handshake = JsonSerializer.Serialize(
-                new DataChannelHandshake { SessionId = sessionId, Role = role, Index = index },
-                TunRelayJsonContext.Default.DataChannelHandshake);
-            await SendAsync(Encoding.UTF8.GetBytes(handshake), ssl, ct);
-            return (tcp, ssl);
+                var handshake = JsonSerializer.Serialize(
+                    new DataChannelHandshake { SessionId = sessionId, Role = role, Index = index },
+                    TunRelayJsonContext.Default.DataChannelHandshake);
+                await SendAsync(Encoding.UTF8.GetBytes(handshake), stream, ct);
+                return (tcp, stream);
+            }
+            catch
+            {
+                tcp.Dispose();
+                throw;
+            }
         }
 
-        private async Task SendAsync(ReadOnlyMemory<byte> data, SslStream sslStream, CancellationToken ct = default)
+        private async Task SendAsync(ReadOnlyMemory<byte> data, Stream stream, CancellationToken ct = default)
         {
             var buffer = ArrayPool<byte>.Shared.Rent(4 + data.Length);
             try
             {
                 BinaryPrimitives.WriteInt32BigEndian(buffer, data.Length);
                 data.CopyTo(buffer.AsMemory(4));
-                await sslStream.WriteAsync(buffer.AsMemory(0, 4 + data.Length), ct);
+                await stream.WriteAsync(buffer.AsMemory(0, 4 + data.Length), ct);
             }
             finally
             {
@@ -82,13 +100,13 @@ namespace TunRelayClient
             }
         }
 
-        private async Task<PacketBuffer> ReceivePacketAsync(SslStream sslStream, CancellationToken ct = default)
+        private async Task<PacketBuffer> ReceivePacketAsync(Stream stream, CancellationToken ct = default)
         {
             byte[] lenBuf = ArrayPool<byte>.Shared.Rent(4);
             int totalLen;
             try
             {
-                await sslStream.ReadExactlyAsync(lenBuf.AsMemory(0, 4), ct);
+                await stream.ReadExactlyAsync(lenBuf.AsMemory(0, 4), ct);
                 totalLen = BinaryPrimitives.ReadInt32BigEndian(lenBuf.AsSpan(0, 4));
             }
             finally
@@ -102,7 +120,7 @@ namespace TunRelayClient
             var payload = PacketBuffer.Rent(totalLen);
             try
             {
-                await sslStream.ReadExactlyAsync(payload.Memory, ct);
+                await stream.ReadExactlyAsync(payload.Memory, ct);
                 return payload;
             }
             catch
@@ -136,17 +154,17 @@ namespace TunRelayClient
             return Encoding.UTF8.GetString(data.Buffer, 0, data.Length);
         }
 
-        // 数据通道 batch 收发直接基于这些 SslStream 建立 PipeWriter/PipeReader
-        public Stream[] TxStreams => _txSsl;
-        public Stream[] RxStreams => _rxSsl;
+        // 数据通道 batch 收发基于统一的 Stream 建立 PipeWriter/PipeReader。
+        public Stream[] TxStreams => _txStreams;
+        public Stream[] RxStreams => _rxStreams;
 
         public void Close()
         {
             ControlConnectionSsl?.Dispose();
             ControlConnectionTcp?.Dispose();
-            foreach (var s in _txSsl) s?.Dispose();
+            foreach (var s in _txStreams) s?.Dispose();
             foreach (var t in _txTcp) t?.Dispose();
-            foreach (var s in _rxSsl) s?.Dispose();
+            foreach (var s in _rxStreams) s?.Dispose();
             foreach (var t in _rxTcp) t?.Dispose();
         }
     }

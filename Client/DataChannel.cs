@@ -37,15 +37,15 @@ namespace TunRelayClient
         private static ILogger? logger => Program.logger;
 
         /// <summary>
-        /// 发送循环: 从单包 channel 聚合一个 batch,通过 PipeWriter 一次写入并 flush 到 TLS。
+        /// 发送循环: 从单包 channel 聚合一个 batch,通过 PipeWriter 一次写入并 flush 到数据流。
         /// </summary>
         public static async Task SendLoopAsync(
             ChannelReader<PacketBuffer> reader,
-            Stream sslStream,
+            Stream stream,
             BatchOptions opt,
             CancellationToken ct)
         {
-            var writer = PipeWriter.Create(sslStream, new StreamPipeWriterOptions(leaveOpen: true));
+            var writer = PipeWriter.Create(stream, new StreamPipeWriterOptions(leaveOpen: true));
             var batch = new List<PacketBuffer>(opt.MaxPackets);
             try
             {
@@ -156,11 +156,11 @@ namespace TunRelayClient
         /// 协议错误会抛出 InvalidDataException 以断开会话;单包 sink 失败会被记录并跳过。
         /// </summary>
         public static async Task ReceiveLoopAsync(
-            Stream sslStream,
+            Stream stream,
             Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask> sink,
             CancellationToken ct)
         {
-            var reader = PipeReader.Create(sslStream, new StreamPipeReaderOptions(leaveOpen: true));
+            var reader = PipeReader.Create(stream, new StreamPipeReaderOptions(leaveOpen: true));
             try
             {
                 while (true)

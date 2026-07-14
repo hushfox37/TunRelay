@@ -77,18 +77,21 @@ public sealed class AuthenticationRequest
     public string ClientID { get; set; } = "";
     public long Timestamp { get; set; }
     public string Sign { get; set; } = "";
+    public string[] SupportedProtocols { get; set; } = Array.Empty<string>();
 }
 
 public sealed class CredentialProvisioningRequest
 {
     public string Mode { get; set; } = "";
     public string ClientID { get; set; } = "";
+    public string[] SupportedProtocols { get; set; } = Array.Empty<string>();
 }
 
 public sealed class CredentialProvisioningResponse
 {
     public string Status { get; set; } = "";
     public string Secret { get; set; } = "";
+    public string Error { get; set; } = "";
 }
 
 [JsonSerializable(typeof(TunRelayConfig))]

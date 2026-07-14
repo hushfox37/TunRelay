@@ -11,6 +11,7 @@ public class TunRelayConfig
     public int[] UdpPorts { get; set; } = Array.Empty<int>();
     public string ClientID { get; set; } = "";
     public string Secret { get; set; } = "";
+    public string Protocol { get; set; } = "tls";
     [JsonIgnore]
     public bool AutoCredentials { get; set; }
     public string LogLevel { get; set; } = "Information";
@@ -72,6 +73,7 @@ namespace TunRelayServer
         public int UplinkConnections { get; set; }
         public int DownlinkConnections { get; set; }
         public string SessionId { get; set; } = "";
+        public string Protocol { get; set; } = "tls";
     }
 
     sealed class AuthenticationRequest
@@ -79,18 +81,21 @@ namespace TunRelayServer
         public string ClientID { get; set; } = "";
         public long Timestamp { get; set; }
         public string Sign { get; set; } = "";
+        public string[] SupportedProtocols { get; set; } = Array.Empty<string>();
     }
 
     sealed class CredentialProvisioningRequest
     {
         public string Mode { get; set; } = "";
         public string ClientID { get; set; } = "";
+        public string[] SupportedProtocols { get; set; } = Array.Empty<string>();
     }
 
     sealed class CredentialProvisioningResponse
     {
         public string Status { get; set; } = "";
         public string Secret { get; set; } = "";
+        public string Error { get; set; } = "";
     }
 
     [JsonSerializable(typeof(TunRelayConfig))]

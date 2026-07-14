@@ -9,6 +9,19 @@ namespace TunRelayClient
         public int Uplink { get; init; }
         public int Downlink { get; init; }
         public string SessionId { get; init; } = "";
+        public DataChannelProtocol Protocol { get; init; }
+
+        public void EnsureCompatibleWith(ServerAssignment expected)
+        {
+            if (!string.Equals(TunnelIp, expected.TunnelIp, StringComparison.Ordinal)
+                || Uplink != expected.Uplink
+                || Downlink != expected.Downlink
+                || Protocol != expected.Protocol)
+            {
+                throw new DataChannelConfigurationException(
+                    $"Reconnect assignment changed: TunnelIP={TunnelIp}, Uplink={Uplink}, Downlink={Downlink}, Protocol={Protocol}");
+            }
+        }
 
         // 解析数据通道建立前服务端下发的控制面参数。
         public static ServerAssignment Parse(string data)
@@ -39,13 +52,18 @@ namespace TunRelayClient
                 throw new InvalidOperationException("服务端未下发 sessionId");
             }
 
+            string? protocol = root.TryGetProperty("Protocol", out var protocolJson)
+                ? protocolJson.GetString()
+                : null;
+
             return new ServerAssignment
             {
                 TunnelIp = tunnelIp,
                 Ports = ports,
                 Uplink = uplink,
                 Downlink = downlink,
-                SessionId = sessionId
+                SessionId = sessionId,
+                Protocol = DataChannelProtocolCodec.Parse(protocol)
             };
         }
     }

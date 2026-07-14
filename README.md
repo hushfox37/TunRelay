@@ -2,14 +2,17 @@
 
 TunRelay is a lightweight intranet tunneling solution. It creates an IP-level
 forwarding path between a Linux server and an internal Windows/Linux client,
-then exposes selected TCP/UDP service ports through an encrypted tunnel.
+then exposes selected TCP/UDP service ports through a tunnel. The control
+channel always uses TLS; data channels can use TLS or explicitly configured
+plaintext TCP.
 
 The server runs on Linux with NFQUEUE/iptables. The client runs on Windows or
 Linux with a TUN adapter.
 
 ## Features
 
-- TLS encrypted client/server tunnel
+- TLS-protected control channel
+- Server-selectable TLS or plaintext TCP data channels
 - HMAC-SHA256 client authentication
 - One-time client credential provisioning
 - Windows client based on Wintun
@@ -161,6 +164,16 @@ For reverse mode:
 iperf3 -c <TunIp> -p <forwarded-port> -R
 ```
 
+For a repeatable data-channel comparison, test each protocol with one, four,
+and eight iperf streams for 30 seconds. Run every case three times and compare
+the medians:
+
+```bash
+iperf3 -c <TunIp> -p <forwarded-port> -P 1 -t 30 -R
+iperf3 -c <TunIp> -p <forwarded-port> -P 4 -t 30 -R
+iperf3 -c <TunIp> -p <forwarded-port> -P 8 -t 30 -R
+```
+
 Where:
 
 - `<TunIp>` is the server `TunIp` value.
@@ -182,6 +195,7 @@ matches the test interval.
   "UdpPorts": [],
   "ClientID": "client-id-from-client-config",
   "Secret": "shared-secret",
+  "Protocol": "tls",
   "LogLevel": "Information",
   "BatchDelayMs": 1,
   "MaxBatchBytes": 65536,
@@ -201,6 +215,7 @@ Fields:
 - `UdpPorts`: UDP service ports forwarded through the tunnel
 - `ClientID`: client identifier allowed to authenticate
 - `Secret`: shared HMAC secret
+- `Protocol`: data-channel transport, either `tls` (default) or plaintext `tcp`
 - `LogLevel`: minimum console log level, for example `Information` or `Trace`
 - `BatchDelayMs`: packet batching wait window in milliseconds
 - `MaxBatchBytes`: maximum encoded packet bytes per batch
@@ -270,6 +285,8 @@ Server options:
 --client-id <id>
 --Secret <secret>
 --secret <secret>
+--Protocol <tls|tcp>
+--protocol <tls|tcp>
 --LogLevel <level>
 --log-level <level>
 --UplinkConnections <count>
@@ -339,6 +356,20 @@ Watch `channelDrops`, `protocolErrors`, and `sinkWriteFailures`; they should
 remain `0` during a healthy run.
 
 ## Tuning
+
+### Data Channel Protocol
+
+`Protocol` is configured only on the server and is sent to the client over the
+TLS control channel. The default, `tls`, encrypts control and data traffic.
+Setting it to `tcp` keeps authentication, configuration, and session control on
+TLS but sends data-channel frames as plaintext TCP. Anyone able to observe or
+modify that network path can read or tamper with tunneled traffic.
+
+The server never automatically downgrades to plaintext. A client that does not
+advertise support for the configured protocol is rejected during authentication.
+Changing the protocol for an existing client session requires restarting the
+client; a different value received during reconnect is treated as a fatal
+configuration change.
 
 ### Batch Tuning
 
