@@ -20,6 +20,7 @@ public class TunRelayConfig
     public int BatchDelayMs { get; set; } = 1;
     public int MaxBatchBytes { get; set; } = 65536;
     public int MaxBatchPackets { get; set; } = 32;
+    public bool AdaptiveBatching { get; set; }
 
     // 多连接并行: 上行(client->server)/下行(server->client)各自的数据连接数(运行时 clamp 到 1..16)。
     // 服务端单边权威,握手时下发给客户端。

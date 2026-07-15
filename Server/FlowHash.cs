@@ -23,6 +23,15 @@ namespace TunRelayServer
                         h = (h ^ packet[i]) * 16777619u;
             }
 
+            // FNV-1a has weak low bits for structured inputs such as the even,
+            // closely-spaced ephemeral ports produced by iperf. Mix all bits
+            // before modulo so power-of-two channel counts are not biased.
+            h ^= h >> 16;
+            h *= 0x85ebca6bu;
+            h ^= h >> 13;
+            h *= 0xc2b2ae35u;
+            h ^= h >> 16;
+
             return (int)(h % (uint)connectionCount);
         }
     }

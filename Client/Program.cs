@@ -16,6 +16,7 @@ namespace TunRelayClient
         public static ConcurrentBag<int> PortConfig = new ConcurrentBag<int>();
         public static ILogger logger = null!;
         public static TunRelayConfig CurrentConfig = null!;
+        public static BatchOptions? CurrentBatchOptions;
         public static LogLevel CurrentLogLevel;
 
         static async Task Main(string[] args)
@@ -115,6 +116,10 @@ namespace TunRelayClient
                     case "--max-batch-packets":
                         config.MaxBatchPackets = ParseInt(ReadValue(args, ref i), "MaxBatchPackets");
                         break;
+                    case "--AdaptiveBatching":
+                    case "--adaptive-batching":
+                        config.AdaptiveBatching = ParseBool(ReadValue(args, ref i), "AdaptiveBatching");
+                        break;
                 }
             }
         }
@@ -132,6 +137,22 @@ namespace TunRelayClient
                 throw new ArgumentException($"{name} must be an integer");
             return result;
         }
+
+        private static bool ParseBool(string value, string name)
+        {
+            if (!bool.TryParse(value, out bool result))
+                throw new ArgumentException($"{name} must be true or false");
+            return result;
+        }
+
+        public static void SetAdaptiveBatching(bool enabled)
+        {
+            CurrentBatchOptions?.SetAdaptiveBatching(enabled);
+            logger?.LogInformation("AdaptiveBatching runtime mode changed to {Enabled}", enabled);
+        }
+
+        public static bool GetAdaptiveBatching()
+            => CurrentBatchOptions?.AdaptiveBatching ?? CurrentConfig?.AdaptiveBatching ?? false;
 
         private static int ParsePort(string value, string name)
         {

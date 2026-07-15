@@ -11,16 +11,23 @@ namespace TunRelayClient
     /// </summary>
     public sealed class BatchOptions
     {
+        private int _adaptiveBatching;
+
         public int DelayMs { get; }
         public int MaxBytes { get; }
         public int MaxPackets { get; }
+        public bool AdaptiveBatching => Volatile.Read(ref _adaptiveBatching) != 0;
 
-        public BatchOptions(int delayMs, int maxBytes, int maxPackets)
+        public BatchOptions(int delayMs, int maxBytes, int maxPackets, bool adaptiveBatching = false)
         {
             DelayMs = Math.Clamp(delayMs, 0, 3);
             MaxBytes = Math.Clamp(maxBytes, 4096, 262144);
             MaxPackets = Math.Clamp(maxPackets, 1, 128);
+            SetAdaptiveBatching(adaptiveBatching);
         }
+
+        public void SetAdaptiveBatching(bool enabled)
+            => Volatile.Write(ref _adaptiveBatching, enabled ? 1 : 0);
     }
 
     /// <summary>
@@ -43,6 +50,7 @@ namespace TunRelayClient
             ChannelReader<PacketBuffer> reader,
             Stream stream,
             BatchOptions opt,
+            int channelIndex,
             CancellationToken ct)
         {
             var writer = PipeWriter.Create(stream, new StreamPipeWriterOptions(leaveOpen: true));
@@ -63,6 +71,7 @@ namespace TunRelayClient
 
                     batch.Add(first);
                     long bytes = first.Length;
+                    int queueDepth = reader.CanCount ? reader.Count + 1 : 1;
 
                     // 立即抽取队列中已有的包(高负载下天然成批,不需要等待)
                     while (batch.Count < opt.MaxPackets && bytes < opt.MaxBytes
@@ -73,7 +82,8 @@ namespace TunRelayClient
                     }
 
                     // 低负载下,在 DelayMs 窗口内等待更多包以合批
-                    if (opt.DelayMs > 0 && batch.Count < opt.MaxPackets && bytes < opt.MaxBytes)
+                    if (!opt.AdaptiveBatching && opt.DelayMs > 0
+                        && batch.Count < opt.MaxPackets && bytes < opt.MaxBytes)
                     {
                         using var delayCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                         delayCts.CancelAfter(opt.DelayMs);
@@ -98,11 +108,10 @@ namespace TunRelayClient
                     WriteBatch(writer, batch);
                     await writer.FlushAsync(ct);
 
-                    TunnelStats.AddBatchSent(batch.Count);
+                    TunnelStats.AddBatchSent(channelIndex, batch.Count, bytes, queueDepth);
                     bool trace = logger?.IsEnabled(LogLevel.Trace) ?? false;
                     foreach (var p in batch)
                     {
-                        TunnelStats.AddSent(p.Length);
                         if (trace)
                             logger?.LogTrace("[Send] len={Len} {Hex}", p.Length, HexDump(p.ReadOnlyMemory.Span));
                         p.Dispose();
@@ -158,6 +167,7 @@ namespace TunRelayClient
         public static async Task ReceiveLoopAsync(
             Stream stream,
             Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask> sink,
+            int channelIndex,
             CancellationToken ct)
         {
             var reader = PipeReader.Create(stream, new StreamPipeReaderOptions(leaveOpen: true));
@@ -177,7 +187,7 @@ namespace TunRelayClient
 
                     var buffer = result.Buffer;
                     while (TryReadFrame(ref buffer, out var frame))
-                        await ProcessFrameAsync(frame, sink, ct);
+                        await ProcessFrameAsync(frame, sink, channelIndex, ct);
 
                     reader.AdvanceTo(buffer.Start, buffer.End);
 
@@ -225,6 +235,7 @@ namespace TunRelayClient
         private static async ValueTask ProcessFrameAsync(
             ReadOnlySequence<byte> frame,
             Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask> sink,
+            int channelIndex,
             CancellationToken ct)
         {
             long pos = 0;
@@ -245,8 +256,8 @@ namespace TunRelayClient
                 throw new InvalidDataException("空 batch");
             }
 
-            TunnelStats.AddBatchReceived();
             bool trace = logger?.IsEnabled(LogLevel.Trace) ?? false;
+            long receivedBytes = 0;
 
             for (int i = 0; i < count; i++)
             {
@@ -285,7 +296,7 @@ namespace TunRelayClient
                     mem = pooled.AsMemory(0, pktLen);
                 }
 
-                TunnelStats.AddReceived(pktLen);
+                receivedBytes += pktLen;
                 if (trace)
                     logger?.LogTrace("[Recv] len={Len} {Hex}", pktLen, HexDump(mem.Span));
 
@@ -314,6 +325,8 @@ namespace TunRelayClient
                 TunnelStats.IncrementProtocolErrors();
                 throw new InvalidDataException("batch 内 packet 长度累加与帧长度不一致");
             }
+
+            TunnelStats.AddBatchReceived(channelIndex, count, receivedBytes);
         }
 
         private static byte ReadU8(ReadOnlySequence<byte> seq, long offset)

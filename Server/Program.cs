@@ -64,8 +64,8 @@ namespace TunRelayServer
             IptablesManager.Init(logger);
             ServerNet.Init(logger, ConfigPath);
 
-            batchOptions = new BatchOptions(config.BatchDelayMs, config.MaxBatchBytes, config.MaxBatchPackets);
-            logger?.LogInformation($"数据通道批处理参数: DelayMs={batchOptions.DelayMs}, MaxBytes={batchOptions.MaxBytes}, MaxPackets={batchOptions.MaxPackets}");
+            batchOptions = new BatchOptions(config.BatchDelayMs, config.MaxBatchBytes, config.MaxBatchPackets, config.AdaptiveBatching);
+            logger?.LogInformation($"数据通道批处理参数: Adaptive={batchOptions.AdaptiveBatching}, DelayMs={batchOptions.DelayMs}, MaxBytes={batchOptions.MaxBytes}, MaxPackets={batchOptions.MaxPackets}");
 
             if (string.IsNullOrWhiteSpace(config.Secret))
             {
@@ -108,10 +108,17 @@ namespace TunRelayServer
             RawSender.Init(logger);
             IptablesManager.Add(tcpPorts, udpPorts);
             NFQueue.Init(logger);
+            TunnelStats.ConfigureChannels(downlinkConnections, uplinkConnections);
 
+            int downlinkQueueCapacity = PacketQueueBudget.CapacityPerChannel(downlinkConnections);
+            logger?.LogInformation(
+                "下行包队列: Channels={Channels}, CapacityPerChannel={Capacity}, ProcessBufferBudgetMiB={Budget}",
+                downlinkConnections,
+                downlinkQueueCapacity,
+                PacketQueueBudget.ProcessBufferBudgetBytes / 1024 / 1024);
             _downlinkChannels = new Channel<PacketBuffer>[downlinkConnections];
             for (int i = 0; i < downlinkConnections; i++)
-                _downlinkChannels[i] = Channel.CreateBounded<PacketBuffer>(new BoundedChannelOptions(8192)
+                _downlinkChannels[i] = Channel.CreateBounded<PacketBuffer>(new BoundedChannelOptions(downlinkQueueCapacity)
                 {
                     SingleReader = true,
                     SingleWriter = false,
@@ -155,11 +162,11 @@ namespace TunRelayServer
 
                     var loops = new List<Task>(uplinkConnections + downlinkConnections);
                     // 上行: server 读 TxStreams[i] -> RawSender
-                    foreach (var tx in session.TxStreams)
-                        loops.Add(ReceiveLoopAsync(tx, clientCts.Token));
+                    for (int i = 0; i < session.TxStreams.Length; i++)
+                        loops.Add(ReceiveLoopAsync(session.TxStreams[i], i, clientCts.Token));
                     // 下行: server 把 downlinkChannels[i] 聚合 -> RxStreams[i]
                     for (int i = 0; i < session.RxStreams.Length; i++)
-                        loops.Add(SendLoopAsync(session.RxStreams[i], _downlinkChannels[i].Reader, clientCts.Token));
+                        loops.Add(SendLoopAsync(session.RxStreams[i], _downlinkChannels[i].Reader, i, clientCts.Token));
 
                     await Task.WhenAny(loops);
                     clientCts.Cancel();
@@ -260,6 +267,10 @@ namespace TunRelayServer
                     case "--max-batch-packets":
                         config.MaxBatchPackets = ParseInt(ReadValue(args, ref i), "MaxBatchPackets");
                         break;
+                    case "--AdaptiveBatching":
+                    case "--adaptive-batching":
+                        config.AdaptiveBatching = ParseBool(ReadValue(args, ref i), "AdaptiveBatching");
+                        break;
                 }
             }
         }
@@ -275,6 +286,13 @@ namespace TunRelayServer
         {
             if (!int.TryParse(value, out var result))
                 throw new ArgumentException($"{name} must be an integer");
+            return result;
+        }
+
+        static bool ParseBool(string value, string name)
+        {
+            if (!bool.TryParse(value, out bool result))
+                throw new ArgumentException($"{name} must be true or false");
             return result;
         }
 
@@ -346,6 +364,14 @@ namespace TunRelayServer
             return CurrentConfig?.AutoCredentials ?? false;
         }
 
+        public static void SetAdaptiveBatching(bool enabled)
+        {
+            batchOptions.SetAdaptiveBatching(enabled);
+            logger?.LogInformation("AdaptiveBatching runtime mode changed to {Enabled}", enabled);
+        }
+
+        public static bool GetAdaptiveBatching() => batchOptions?.AdaptiveBatching ?? false;
+
         static int[] NormalizePorts(IEnumerable<int> values)
         {
             return values.Distinct().OrderBy(port => port).ToArray();
@@ -368,13 +394,14 @@ namespace TunRelayServer
         }
 
         // 上行: 数据流解析 batch -> 直接逐包注入 Raw socket(不再经过 channel)
-        static async Task ReceiveLoopAsync(Stream dataStream, CancellationToken ct)
+        static async Task ReceiveLoopAsync(Stream dataStream, int channelIndex, CancellationToken ct)
         {
             try
             {
                 await DataChannel.ReceiveLoopAsync(
                     dataStream,
                     (packet, _) => { RawSender.Send(packet); return ValueTask.CompletedTask; },
+                    channelIndex,
                     ct);
             }
             catch (OperationCanceledException) { }
@@ -382,11 +409,11 @@ namespace TunRelayServer
         }
 
         // 下行: 指定 channel 聚合成 batch -> 数据流写
-        static async Task SendLoopAsync(Stream dataStream, ChannelReader<PacketBuffer> reader, CancellationToken ct)
+        static async Task SendLoopAsync(Stream dataStream, ChannelReader<PacketBuffer> reader, int channelIndex, CancellationToken ct)
         {
             try
             {
-                await DataChannel.SendLoopAsync(reader, dataStream, batchOptions, ct);
+                await DataChannel.SendLoopAsync(reader, dataStream, batchOptions, channelIndex, ct);
             }
             catch (OperationCanceledException) { }
             catch (Exception ex) { logger?.LogWarning($"数据连接断开(发): {ex.Message}"); }

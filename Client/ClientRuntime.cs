@@ -29,6 +29,7 @@ namespace TunRelayClient
             int uplink = control.Assignment.Uplink;
             int downlink = control.Assignment.Downlink;
             var protocol = control.Assignment.Protocol;
+            TunnelStats.ConfigureChannels(uplink, downlink);
             ApplyPortConfig(control.Assignment.Ports);
             RuntimeStatus.SetAssigned(uplink, downlink, control.Assignment.SessionId);
 
@@ -41,8 +42,9 @@ namespace TunRelayClient
             Program.tunnelTUN = new TUN(driver, uplinkChannels);
             await Program.tunnelTUN.StartAsync(Program.TunnelIP, ct);
 
-            var batchOptions = new BatchOptions(_config.BatchDelayMs, _config.MaxBatchBytes, _config.MaxBatchPackets);
-            _logger.LogInformation($"数据通道批处理参数: DelayMs={batchOptions.DelayMs}, MaxBytes={batchOptions.MaxBytes}, MaxPackets={batchOptions.MaxPackets}");
+            var batchOptions = new BatchOptions(_config.BatchDelayMs, _config.MaxBatchBytes, _config.MaxBatchPackets, _config.AdaptiveBatching);
+            Program.CurrentBatchOptions = batchOptions;
+            _logger.LogInformation($"数据通道批处理参数: Adaptive={batchOptions.AdaptiveBatching}, DelayMs={batchOptions.DelayMs}, MaxBytes={batchOptions.MaxBytes}, MaxPackets={batchOptions.MaxPackets}");
 
             while (!ct.IsCancellationRequested)
             {
@@ -77,18 +79,26 @@ namespace TunRelayClient
             }
         }
 
-        private static Channel<PacketBuffer>[] CreateUplinkChannels(int uplink)
+        private Channel<PacketBuffer>[] CreateUplinkChannels(int uplink)
         {
+            int queueCapacity = PacketQueueBudget.CapacityPerChannel(uplink);
             var uplinkChannels = new Channel<PacketBuffer>[uplink];
             for (int i = 0; i < uplink; i++)
             {
-                uplinkChannels[i] = Channel.CreateBounded<PacketBuffer>(new BoundedChannelOptions(4096)
+                uplinkChannels[i] = Channel.CreateBounded<PacketBuffer>(new BoundedChannelOptions(queueCapacity)
                 {
-                    FullMode = BoundedChannelFullMode.DropOldest,
+                    // TryWrite 保持读取热路径非阻塞；满队列时由调用方释放新包并计数。
+                    FullMode = BoundedChannelFullMode.Wait,
                     SingleReader = true,
                     SingleWriter = true
                 });
             }
+
+            _logger.LogInformation(
+                "上行包队列: Channels={Channels}, CapacityPerChannel={Capacity}, ProcessBufferBudgetMiB={Budget}",
+                uplink,
+                queueCapacity,
+                PacketQueueBudget.ProcessBufferBudgetBytes / 1024 / 1024);
 
             return uplinkChannels;
         }
@@ -119,7 +129,7 @@ namespace TunRelayClient
                 for (int i = 0; i < uplink; i++)
                 {
                     int idx = i;
-                    loops.Add(($"tx#{idx}", Task.Run(() => DataChannel.SendLoopAsync(uplinkChannels[idx].Reader, txStreams[idx], batchOptions, sessionToken))));
+                    loops.Add(($"tx#{idx}", Task.Run(() => DataChannel.SendLoopAsync(uplinkChannels[idx].Reader, txStreams[idx], batchOptions, idx, sessionToken))));
                 }
 
                 var rxStreams = net.RxStreams;
@@ -129,6 +139,7 @@ namespace TunRelayClient
                     loops.Add(($"rx#{idx}", Task.Run(() => DataChannel.ReceiveLoopAsync(
                         rxStreams[idx],
                         (packet, c) => new ValueTask(Program.tunnelTUN.WriteAsync(packet, c)),
+                        idx,
                         sessionToken))));
                 }
 

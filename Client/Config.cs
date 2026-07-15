@@ -17,6 +17,7 @@ public class TunRelayConfig
     public int BatchDelayMs { get; set; } = 1;
     public int MaxBatchBytes { get; set; } = 65536;
     public int MaxBatchPackets { get; set; } = 32;
+    public bool AdaptiveBatching { get; set; }
     public int ReconnectDelayMs { get; set; } = 5000;
     public int MaxReconnectAttempts { get; set; } = 0;
 

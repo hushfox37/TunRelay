@@ -9,6 +9,48 @@ namespace TunRelayClient
     /// </summary>
     public static class TunnelStats
     {
+        private sealed class ChannelCounter
+        {
+            private long _packets;
+            private long _bytes;
+            private long _batches;
+            private long _flushes;
+            private long _queuePeak;
+
+            public void AddBatch(int packets, long bytes, int queueDepth, bool flushed)
+            {
+                Interlocked.Add(ref _packets, packets);
+                Interlocked.Add(ref _bytes, bytes);
+                Interlocked.Increment(ref _batches);
+                if (flushed)
+                    Interlocked.Increment(ref _flushes);
+                UpdatePeak(ref _queuePeak, queueDepth);
+            }
+
+            public void Reset()
+            {
+                Interlocked.Exchange(ref _packets, 0);
+                Interlocked.Exchange(ref _bytes, 0);
+                Interlocked.Exchange(ref _batches, 0);
+                Interlocked.Exchange(ref _flushes, 0);
+                Interlocked.Exchange(ref _queuePeak, 0);
+            }
+
+            public void AppendTo(StringBuilder sb, string direction, int index)
+            {
+                long packets = Interlocked.Read(ref _packets);
+                long bytes = Interlocked.Read(ref _bytes);
+                long batches = Interlocked.Read(ref _batches);
+                long flushes = Interlocked.Read(ref _flushes);
+                long queuePeak = Interlocked.Read(ref _queuePeak);
+                double average = batches > 0 ? packets / (double)batches : 0;
+                sb.AppendLine($"{direction}#{index,-2}             : {packets} pkts, {bytes} bytes, {batches} batches, avg={average:F2}, flush={flushes}, queuePeak={queuePeak}");
+            }
+        }
+
+        private static ChannelCounter[] _sendChannels = Array.Empty<ChannelCounter>();
+        private static ChannelCounter[] _receiveChannels = Array.Empty<ChannelCounter>();
+
         private static long _packetsSent;
         private static long _bytesSent;
         private static long _batchesSent;
@@ -26,21 +68,27 @@ namespace TunRelayClient
 
         private static long _startTicks = DateTime.UtcNow.Ticks;
 
-        public static void AddSent(int bytes)
+        public static void ConfigureChannels(int sendCount, int receiveCount)
         {
-            Interlocked.Increment(ref _packetsSent);
+            Volatile.Write(ref _sendChannels, CreateCounters(sendCount));
+            Volatile.Write(ref _receiveChannels, CreateCounters(receiveCount));
+        }
+
+        public static void AddBatchSent(int channelIndex, int packetCount, long bytes, int queueDepth)
+        {
+            Interlocked.Add(ref _packetsSent, packetCount);
             Interlocked.Add(ref _bytesSent, bytes);
+            Interlocked.Increment(ref _batchesSent);
+            GetCounter(Volatile.Read(ref _sendChannels), channelIndex)?.AddBatch(packetCount, bytes, queueDepth, flushed: true);
         }
 
-        public static void AddBatchSent(int packetCount) => Interlocked.Increment(ref _batchesSent);
-
-        public static void AddReceived(int bytes)
+        public static void AddBatchReceived(int channelIndex, int packetCount, long bytes)
         {
-            Interlocked.Increment(ref _packetsReceived);
+            Interlocked.Add(ref _packetsReceived, packetCount);
             Interlocked.Add(ref _bytesReceived, bytes);
+            Interlocked.Increment(ref _batchesReceived);
+            GetCounter(Volatile.Read(ref _receiveChannels), channelIndex)?.AddBatch(packetCount, bytes, 0, flushed: false);
         }
-
-        public static void AddBatchReceived() => Interlocked.Increment(ref _batchesReceived);
 
         public static void IncrementChannelDrops() => Interlocked.Increment(ref _channelDrops);
         public static void IncrementProtocolErrors() => Interlocked.Increment(ref _protocolErrors);
@@ -61,6 +109,10 @@ namespace TunRelayClient
             Interlocked.Exchange(ref _sinkWriteFailures, 0);
             Interlocked.Exchange(ref _routeUpdatesQueued, 0);
             Interlocked.Exchange(ref _routeUpdateFailures, 0);
+            foreach (var counter in Volatile.Read(ref _sendChannels))
+                counter.Reset();
+            foreach (var counter in Volatile.Read(ref _receiveChannels))
+                counter.Reset();
             Interlocked.Exchange(ref _startTicks, DateTime.UtcNow.Ticks);
         }
 
@@ -93,8 +145,34 @@ namespace TunRelayClient
             sb.AppendLine($"protocolErrors    : {protocolErrors}");
             sb.AppendLine($"sinkWriteFailures : {sinkFailures}");
             sb.AppendLine($"routeUpdates      : queued={routeQueued}, failures={routeFailures}");
+            AppendChannels(sb, "send", Volatile.Read(ref _sendChannels));
+            AppendChannels(sb, "recv", Volatile.Read(ref _receiveChannels));
             sb.Append("=======================");
             return sb.ToString();
+        }
+
+        private static ChannelCounter[] CreateCounters(int count)
+            => Enumerable.Range(0, Math.Max(0, count)).Select(_ => new ChannelCounter()).ToArray();
+
+        private static ChannelCounter? GetCounter(ChannelCounter[] counters, int index)
+            => (uint)index < (uint)counters.Length ? counters[index] : null;
+
+        private static void AppendChannels(StringBuilder sb, string direction, ChannelCounter[] counters)
+        {
+            for (int i = 0; i < counters.Length; i++)
+                counters[i].AppendTo(sb, direction, i);
+        }
+
+        private static void UpdatePeak(ref long target, long value)
+        {
+            long current = Volatile.Read(ref target);
+            while (value > current)
+            {
+                long observed = Interlocked.CompareExchange(ref target, value, current);
+                if (observed == current)
+                    return;
+                current = observed;
+            }
         }
     }
 
@@ -110,6 +188,7 @@ namespace TunRelayClient
             "  loglevel <level>  动态调整日志级别\n" +
             "  stats        打印当前统计快照\n" +
             "  stats reset  清零统计\n" +
+            "  batch adaptive on|off|status  切换运行时自适应批处理\n" +
             "  help         显示帮助";
 
         public static async Task RunAsync(CancellationToken ct)
@@ -141,6 +220,11 @@ namespace TunRelayClient
                 if (command.StartsWith("loglevel ", StringComparison.OrdinalIgnoreCase))
                 {
                     SetLogLevel(command["loglevel ".Length..].Trim());
+                    continue;
+                }
+                if (command.StartsWith("batch adaptive", StringComparison.OrdinalIgnoreCase))
+                {
+                    HandleAdaptiveBatching(command["batch adaptive".Length..].Trim());
                     continue;
                 }
 
@@ -200,10 +284,34 @@ namespace TunRelayClient
             sb.AppendLine($"BatchDelayMs          : {config.BatchDelayMs}");
             sb.AppendLine($"MaxBatchBytes         : {config.MaxBatchBytes}");
             sb.AppendLine($"MaxBatchPackets       : {config.MaxBatchPackets}");
+            sb.AppendLine($"AdaptiveBatching      : configured={config.AdaptiveBatching}, runtime={Program.GetAdaptiveBatching()}");
             sb.AppendLine($"ReconnectDelayMs      : {config.ReconnectDelayMs}");
             sb.AppendLine($"MaxReconnectAttempts  : {config.MaxReconnectAttempts}");
             sb.Append("========================");
             return sb.ToString();
+        }
+
+        private static void HandleAdaptiveBatching(string value)
+        {
+            switch (value.ToLowerInvariant())
+            {
+                case "on":
+                case "true":
+                    Program.SetAdaptiveBatching(true);
+                    break;
+                case "off":
+                case "false":
+                    Program.SetAdaptiveBatching(false);
+                    break;
+                case "":
+                case "status":
+                    break;
+                default:
+                    Console.WriteLine("[shell] 用法: batch adaptive on | off | status");
+                    return;
+            }
+
+            Console.WriteLine($"[shell] AdaptiveBatching={(Program.GetAdaptiveBatching() ? "on" : "off")} (runtime only)");
         }
     }
 }
