@@ -147,6 +147,8 @@ namespace TunRelayClient
 
     public class WintunDriver : ITunDriver
     {
+        private const int Ipv4Mtu = 65531;
+
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         delegate IntPtr WintunCreateAdapterDelegate(
             [MarshalAs(UnmanagedType.LPWStr)] string name,
@@ -298,9 +300,11 @@ namespace TunRelayClient
             uint idx = 0;
             uint indexResult = ConvertInterfaceLuidToIndex(ref netLUID, out idx);
             if (indexResult != 0)
-                logger?.LogWarning($"ConvertInterfaceLuidToIndex failed: {indexResult}");
+                throw new InvalidOperationException($"ConvertInterfaceLuidToIndex failed: {indexResult}");
             else
                 logger?.LogInformation($"WinTun interface index: {idx}");
+
+            SetIPv4Mtu(idx);
 
             _session = startSession(_adapter, 0x400000);
             _readWaitEvent = getReadWaitEvent(_session);
@@ -312,6 +316,33 @@ namespace TunRelayClient
             _routeWorker = Task.Run(() => RouteWorkerAsync(ct), ct);
 
             return Task.CompletedTask;
+        }
+
+        private static void SetIPv4Mtu(uint interfaceIndex)
+        {
+            var startInfo = new ProcessStartInfo(
+                "netsh",
+                $"interface ipv4 set subinterface interface={interfaceIndex} mtu={Ipv4Mtu} store=active")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            using var process = Process.Start(startInfo)
+                ?? throw new InvalidOperationException("Failed to start netsh while setting Wintun MTU");
+            string output = process.StandardOutput.ReadToEnd();
+            string error = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+
+            if (process.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    $"Failed to set Wintun IPv4 MTU to {Ipv4Mtu}: exit={process.ExitCode} {output}{error}");
+            }
+
+            logger?.LogInformation($"WinTun IPv4 MTU: {Ipv4Mtu}");
         }
 
         private static void SetIPv4Address(ulong LUID, string ip, byte prefixLength)

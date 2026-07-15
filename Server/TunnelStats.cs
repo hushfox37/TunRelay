@@ -17,6 +17,7 @@ namespace TunRelayServer
         private static long _batchesReceived;
 
         private static long _channelDrops;
+        private static long _truncatedPackets;
         private static long _protocolErrors;
         private static long _sinkWriteFailures;
 
@@ -39,6 +40,8 @@ namespace TunRelayServer
         public static void AddBatchReceived() => Interlocked.Increment(ref _batchesReceived);
 
         public static void IncrementChannelDrops() => Interlocked.Increment(ref _channelDrops);
+        public static long IncrementTruncatedPackets() => Interlocked.Increment(ref _truncatedPackets);
+        internal static long TruncatedPackets => Interlocked.Read(ref _truncatedPackets);
         public static void IncrementProtocolErrors() => Interlocked.Increment(ref _protocolErrors);
         public static void IncrementSinkWriteFailures() => Interlocked.Increment(ref _sinkWriteFailures);
 
@@ -51,6 +54,7 @@ namespace TunRelayServer
             Interlocked.Exchange(ref _bytesReceived, 0);
             Interlocked.Exchange(ref _batchesReceived, 0);
             Interlocked.Exchange(ref _channelDrops, 0);
+            Interlocked.Exchange(ref _truncatedPackets, 0);
             Interlocked.Exchange(ref _protocolErrors, 0);
             Interlocked.Exchange(ref _sinkWriteFailures, 0);
             Interlocked.Exchange(ref _startTicks, DateTime.UtcNow.Ticks);
@@ -65,6 +69,7 @@ namespace TunRelayServer
             long bytesReceived = Interlocked.Read(ref _bytesReceived);
             long batchesReceived = Interlocked.Read(ref _batchesReceived);
             long channelDrops = Interlocked.Read(ref _channelDrops);
+            long truncatedPackets = Interlocked.Read(ref _truncatedPackets);
             long protocolErrors = Interlocked.Read(ref _protocolErrors);
             long sinkFailures = Interlocked.Read(ref _sinkWriteFailures);
 
@@ -80,6 +85,7 @@ namespace TunRelayServer
             sb.AppendLine($"avgPktsPerBatch   : sent={avgPktPerBatchSent:F2}, recv={avgPktPerBatchRecv:F2}");
             sb.AppendLine($"throughput        : out={bytesSent / seconds / 1024.0:F1} KB/s, in={bytesReceived / seconds / 1024.0:F1} KB/s");
             sb.AppendLine($"channelDrops      : {channelDrops}");
+            sb.AppendLine($"truncatedPackets  : {truncatedPackets}");
             sb.AppendLine($"protocolErrors    : {protocolErrors}");
             sb.AppendLine($"sinkWriteFailures : {sinkFailures}");
             sb.Append("=======================");
